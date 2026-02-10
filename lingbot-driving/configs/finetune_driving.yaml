@@ -1,0 +1,174 @@
+# finetune_driving.yaml
+# 
+# Configuration for fine-tuning LingBot-World's action adapter on driving data.
+#
+# Key insight from the paper (Section 3.3.2):
+#   "We freeze the main DiT blocks of the pre-trained fundamental world model
+#    and only finetune the newly added action adapter layers"
+#
+# This means we're training a tiny fraction of the 28B model:
+#   - Plücker encoder projection layers
+#   - AdaLN scale/shift parameters
+#   - Action embedding fusion layers
+#
+# Everything else (the full DiT backbone, MoE experts) stays frozen.
+
+# =============================================================================
+# MODEL
+# =============================================================================
+model:
+  # Base model: LingBot-World camera-conditioned variant
+  base_model: "robbyant/lingbot-world-base-cam"
+  
+  # Which components to train vs freeze
+  freeze_backbone: true       # Freeze all DiT blocks (visual quality preservation)
+  freeze_text_encoder: true   # Freeze text conditioning path
+  train_action_adapter: true  # Train Plücker encoder + AdaLN layers
+  
+  # Action adapter architecture (matching paper Section 3.3.2)
+  action_adapter:
+    # Plücker embedding dimension
+    plucker_dim: 6            # Standard 6D Plücker coordinates
+    
+    # Discrete action dimension  
+    # LingBot uses ~4D for WASD. We use 14D for richer driving actions.
+    discrete_action_dim: 14
+    
+    # Combined action dimension fed to AdaLN
+    # = plucker_dim + discrete_action_dim
+    total_action_dim: 20
+    
+    # Projection layers before AdaLN injection
+    hidden_dim: 512
+    num_projection_layers: 2
+    
+    # AdaLN: modulate DiT features via scale and shift
+    # output_dim should match DiT hidden dimension
+    adaln_output_dim: null  # auto-detect from base model
+
+# =============================================================================
+# DATA  
+# =============================================================================
+data:
+  # Training manifest from build_training_manifest.py
+  train_manifest: "data/training_ready/training_manifest.json"
+  
+  # Validation (hold out ~10% of scenes)
+  val_manifest: "data/training_ready/val_manifest.json"
+  
+  # Data root (where frame directories live)
+  data_root: "data/nuscenes_processed/"
+  
+  # Frame sampling
+  num_frames: 16              # Frames per training clip
+  frame_stride: 1             # Sample every Nth frame
+  resolution: [720, 1280]     # H x W (720p, matching LingBot default)
+  
+  # Caption selection during training
+  # LingBot trains with different caption types for different objectives
+  caption_mode: "mixed"       # Options: narrative, scene_static, mixed
+  scene_static_ratio: 0.3     # 30% of time use scene-static (decouples motion from scene)
+  
+  # Action conditioning
+  action_noise_std: 0.01      # Small noise on Plücker embeddings for robustness
+  action_dropout: 0.1         # 10% of time drop action signal (classifier-free guidance)
+
+# =============================================================================
+# TRAINING
+# =============================================================================
+training:
+  # Curriculum strategy (Section 3.3.1)
+  # Start with short clips, progressively extend
+  curriculum:
+    stages:
+      - clip_length_sec: 5
+        num_steps: 10000
+        learning_rate: 1.0e-4
+      - clip_length_sec: 10
+        num_steps: 5000
+        learning_rate: 5.0e-5
+      - clip_length_sec: 20
+        num_steps: 5000
+        learning_rate: 2.0e-5
+  
+  # Optimizer
+  optimizer: "AdamW"
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  
+  # Batch size (per GPU)
+  batch_size_per_gpu: 1       # 720p video is memory-heavy
+  gradient_accumulation: 8    # Effective batch = 8 * num_gpus
+  
+  # Training duration
+  max_steps: 20000
+  warmup_steps: 500
+  
+  # Logging
+  log_interval: 50
+  save_interval: 1000
+  val_interval: 500
+  
+  # Mixed precision
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+
+# =============================================================================
+# PARALLELISM (Section 3.3.3)
+# =============================================================================
+parallelism:
+  # FSDP2 for model sharding
+  fsdp:
+    enabled: true
+    sharding_strategy: "FULL_SHARD"
+    # Only shard the frozen backbone; action adapter is small enough to replicate
+    shard_frozen_params: true
+  
+  # Context parallel for long sequences (Ulysses)
+  context_parallel:
+    enabled: true
+    # Number of GPUs for sequence parallelism
+    # Set based on clip length: longer clips need more CP
+    cp_size: 2
+  
+  # Total GPU layout
+  # Example: 8 GPUs → 4 data parallel × 2 context parallel
+  num_gpus: 8
+  data_parallel_size: 4  # = num_gpus / cp_size
+
+# =============================================================================
+# INFERENCE / EVALUATION
+# =============================================================================
+inference:
+  # For evaluation: generate driving videos conditioned on action sequences
+  num_diffusion_steps: 50     # Full quality (middle-trained model)
+  cfg_scale: 7.5              # Classifier-free guidance scale
+  
+  # Action input format for inference
+  # User provides: sequence of (steering, speed) → converted to Plücker + multihot
+  action_input_mode: "driving"  # Options: raw_plucker, driving, replay
+  
+  # Evaluation metrics
+  eval_metrics:
+    - "fid"                   # Fréchet Inception Distance (visual quality)
+    - "fvd"                   # Fréchet Video Distance (temporal quality)
+    - "action_following"      # Custom: does generated video follow input actions?
+
+# =============================================================================
+# NOTES
+# =============================================================================
+# 
+# Estimated compute requirements (based on paper's parallelism details):
+#   - 8x A100 80GB: ~3 days for full curriculum
+#   - 4x A100 80GB: ~5 days (reduce CP size to 1, increase grad accumulation)
+#   - 1x A100 80GB: feasible for 5s clips only, ~2 days for 10K steps
+#
+# Key differences from LingBot's gaming setup:
+#   1. Action space: 14D driving multihot vs 4D WASD
+#   2. Camera motion: primarily forward + yaw (driving) vs full 6DoF (gaming)
+#   3. Frame rate: 2-10 Hz (driving datasets) vs 30+ Hz (games)
+#   4. Scene diversity: real-world variation vs game engine variation
+#
+# The frozen backbone approach means we inherit LingBot's visual quality
+# while teaching only the action response — this is what makes the
+# approach feasible with limited driving data.

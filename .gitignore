@@ -1,0 +1,42 @@
+# Datasets
+nuScenes*/
+nuscenes*/
+data/
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+!requirements*.txt
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output
+demo_output/
+outputs/
+wandb/
+*.mp4
+*.avi
+
+# Temp
+*.tmp
+*.log

@@ -315,22 +315,30 @@ def load_and_preprocess_frame(path, resolution=480):
 # LoRA Injection into LingBot-World
 # =============================================================================
 
-def inject_lora_into_model(model, rank=16, alpha=16, target_modules=None):
+def inject_lora_into_model(model, rank=16, alpha=16, target_modules=None,
+                           causal=False):
     """
     Inject LoRA adapters into LingBot-World's DiT blocks.
-    
+
     Targets:
     - Self-attention Q, K, V projections (visual domain adaptation)
     - Cross-attention Q, K, V projections (text conditioning)
-    
+
+    When causal=True, only targets self-attention Q/K/V on the high-noise
+    expert (for causal LoRA training at 4-6 denoising steps).
+
     The action adapter gets full training (not LoRA) since it's already small.
     """
     if target_modules is None:
-        # Default: attention projections in DiT blocks
-        target_modules = [
-            'to_q', 'to_k', 'to_v',       # Self-attention
-            'to_q_cross', 'to_k_cross', 'to_v_cross',  # Cross-attention
-        ]
+        if causal:
+            # Causal mode: only self-attention Q/K/V
+            target_modules = ['self_attn.q', 'self_attn.k', 'self_attn.v']
+        else:
+            # Default: attention projections in DiT blocks
+            target_modules = [
+                'to_q', 'to_k', 'to_v',       # Self-attention
+                'to_q_cross', 'to_k_cross', 'to_v_cross',  # Cross-attention
+            ]
     
     lora_params = []
     replaced_count = 0
@@ -356,19 +364,20 @@ def inject_lora_into_model(model, rank=16, alpha=16, target_modules=None):
     return lora_params
 
 
-def setup_training(model, action_adapter, lora_rank=16, learning_rate=1e-4):
+def setup_training(model, action_adapter, lora_rank=16, learning_rate=1e-4,
+                   causal=False):
     """
     Set up optimizer with different learning rates for different components.
-    
+
     - LoRA adapters: lr (learning new visual domain)
     - Action adapter: lr * 2 (needs to learn driving dynamics from scratch)
     """
     # Freeze everything first
     for param in model.parameters():
         param.requires_grad = False
-    
+
     # Inject LoRA (unfreezes LoRA params)
-    lora_params = inject_lora_into_model(model, rank=lora_rank)
+    lora_params = inject_lora_into_model(model, rank=lora_rank, causal=causal)
     
     # Action adapter is fully trainable
     action_params = list(action_adapter.parameters())
@@ -394,23 +403,30 @@ def setup_training(model, action_adapter, lora_rank=16, learning_rate=1e-4):
 # Training Loop
 # =============================================================================
 
-def train_step(model, action_adapter, vae, text_encoder, batch, noise_scheduler, device):
+def train_step(model, action_adapter, vae, text_encoder, batch, noise_scheduler,
+               device, causal=False, diffusion_forcing=False):
     """
     Single training step for driving LoRA.
-    
+
     Following LingBot's diffusion training (Section 3.1):
     1. Encode video to latents via VAE
     2. Add noise at random timestep
     3. Predict noise conditioned on: text + action signals
     4. Compute MSE loss
+
+    Args:
+        causal: If True, use causal attention mask during the forward pass.
+        diffusion_forcing: If True, sample per-frame random timesteps for
+            robustness (helps the model handle varying noise levels at chunk
+            boundaries during autoregressive inference).
     """
     video = batch['video'].to(device)           # (B, T, C, H, W)
     plucker = batch['plucker'].to(device)       # (B, T, 6)
     multihot = batch['multihot'].to(device)     # (B, T, 14)
     captions = batch['caption']                  # list of strings
-    
+
     B, T = video.shape[:2]
-    
+
     # 1. Encode video frames to latent space
     with torch.no_grad():
         # Reshape for VAE: (B*T, C, H, W)
@@ -418,25 +434,37 @@ def train_step(model, action_adapter, vae, text_encoder, batch, noise_scheduler,
         latents = vae.encode(video_flat).latent_dist.sample()
         latents = latents.reshape(B, T, *latents.shape[1:])
         latents = latents * vae.config.scaling_factor
-    
+
     # 2. Encode text captions
     with torch.no_grad():
         text_embeddings = encode_text(text_encoder, captions, device)
-    
+
     # 3. Compute action conditioning via our driving adapter
     action_scale, action_shift = action_adapter(plucker, multihot)
-    
+
     # 4. Sample noise and timesteps
     noise = torch.randn_like(latents)
-    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
-                              (B,), device=device).long()
-    
+    if diffusion_forcing:
+        # Per-frame random timesteps for robustness
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
+                                  (B, T), device=device).long()
+    else:
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
+                                  (B,), device=device).long()
+
     # 5. Add noise to latents
-    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-    
+    if diffusion_forcing:
+        # Per-frame noise addition
+        noisy_latents = torch.zeros_like(latents)
+        for t_idx in range(T):
+            noisy_latents[:, t_idx] = noise_scheduler.add_noise(
+                latents[:, t_idx], noise[:, t_idx], timesteps[:, t_idx])
+    else:
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
     # 6. Predict noise (with action conditioning injected via AdaLN)
-    # The action_scale and action_shift modulate DiT features:
-    #   features = action_scale * LayerNorm(features) + action_shift
+    # When causal=True, the underlying flash_attention uses a causal mask
+    # so each frame can only attend to past + current frames.
     noise_pred = model(
         noisy_latents,
         timesteps,
@@ -444,10 +472,10 @@ def train_step(model, action_adapter, vae, text_encoder, batch, noise_scheduler,
         action_scale=action_scale,
         action_shift=action_shift,
     ).sample
-    
+
     # 7. MSE loss
     loss = F.mse_loss(noise_pred, noise)
-    
+
     return loss
 
 
@@ -558,6 +586,10 @@ def main():
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     parser.add_argument('--wandb', action='store_true', help='Log to Weights & Biases')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--causal', action='store_true',
+                        help='Train with causal attention (flash_attention causal=True)')
+    parser.add_argument('--diffusion_forcing', action='store_true',
+                        help='Use per-frame random timesteps for robustness')
     args = parser.parse_args()
     
     # Setup
@@ -571,6 +603,10 @@ def main():
     logger.info(f"Device: {device}")
     logger.info(f"LoRA rank: {args.lora_rank}")
     logger.info(f"Resolution: {args.resolution}p")
+    if args.causal:
+        logger.info("Causal mode: targeting self_attn Q/K/V only")
+    if args.diffusion_forcing:
+        logger.info("Diffusion forcing: per-frame random timesteps")
     
     # W&B logging
     if args.wandb:
@@ -634,7 +670,8 @@ def main():
     ).to(device)
     
     # Setup optimizer (injects LoRA and configures param groups)
-    optimizer = setup_training(dit, action_adapter, args.lora_rank, args.learning_rate)
+    optimizer = setup_training(dit, action_adapter, args.lora_rank,
+                               args.learning_rate, causal=args.causal)
     
     # Resume from checkpoint if specified
     start_step = 0
@@ -689,7 +726,9 @@ def main():
         
         # Forward + backward
         loss = train_step(dit, action_adapter, vae, text_encoder,
-                         batch, noise_scheduler, device)
+                         batch, noise_scheduler, device,
+                         causal=args.causal,
+                         diffusion_forcing=args.diffusion_forcing)
         loss = loss / args.gradient_accumulation
         loss.backward()
         

@@ -288,6 +288,83 @@ class LingBotDriver:
         logger.info(f"Saved: {path}")
 
 
+class LingBotDriverCausal:
+    """
+    Wraps WanI2VCausal for KV-cached streaming chunk generation.
+
+    Each generate() call uses the KV cache from prior chunks, giving ~2-4s
+    latency after the first chunk (vs ~8s for the non-cached fast path).
+    """
+
+    def __init__(self, ckpt_dir, size="480*832", t5_cpu=True,
+                 max_cache_chunks=4, sampling_steps=6):
+        self.ckpt_dir = ckpt_dir
+        self.size = size
+        self.t5_cpu = t5_cpu
+        self.max_cache_chunks = max_cache_chunks
+        self.sampling_steps = sampling_steps
+        self._model = None
+
+        parts = size.split('*')
+        self.height, self.width = int(parts[0]), int(parts[1])
+
+    def _load(self):
+        if self._model is not None:
+            return
+
+        lingbot_root = Path(__file__).resolve().parent.parent.parent / 'lingbot-world'
+        if str(lingbot_root) not in sys.path:
+            sys.path.insert(0, str(lingbot_root))
+
+        import wan
+        from wan.configs import WAN_CONFIGS
+
+        cfg = WAN_CONFIGS['i2v-A14B']
+        logger.info(f"Loading WanI2VCausal from {self.ckpt_dir} ...")
+        self._model = wan.WanI2VCausal(
+            config=cfg,
+            checkpoint_dir=self.ckpt_dir,
+            device_id=0,
+            t5_cpu=self.t5_cpu,
+            max_cache_chunks=self.max_cache_chunks,
+            sampling_steps=self.sampling_steps,
+            max_area=self.height * self.width,
+        )
+        logger.info("Causal model loaded.")
+
+    def generate(self, image, prompt, poses, intrinsics,
+                 frame_num=17, shift=3.0, seed=42):
+        """Generate a video chunk using KV-cached causal inference."""
+        self._load()
+
+        video, last_pil = self._model.generate_chunk(
+            img=image,
+            prompt=prompt,
+            c2ws=poses[:frame_num],
+            intrinsics=intrinsics[:frame_num],
+            frame_num=frame_num,
+            shift=shift,
+            seed=seed,
+        )
+        return video, last_pil
+
+    def reset(self):
+        """Reset causal streaming state."""
+        if self._model is not None:
+            self._model.reset()
+
+    def save_video(self, video_tensor, path, fps=16):
+        if video_tensor is None:
+            return
+        lingbot_root = Path(__file__).resolve().parent.parent.parent / 'lingbot-world'
+        if str(lingbot_root) not in sys.path:
+            sys.path.insert(0, str(lingbot_root))
+        from wan.utils.utils import save_video
+        save_video(tensor=video_tensor[None], save_file=path, fps=fps,
+                   nrow=1, normalize=True, value_range=(-1, 1))
+        logger.info(f"Saved: {path}")
+
+
 # =============================================================================
 # Terminal Mode
 # =============================================================================
@@ -313,11 +390,18 @@ def run_terminal(args):
 
     driver = None
     if not args.dry_run:
-        driver = LingBotDriver(ckpt_dir=args.ckpt_dir, size=args.size,
-                                t5_cpu=True)
+        if args.causal:
+            driver = LingBotDriverCausal(
+                ckpt_dir=args.ckpt_dir, size=args.size, t5_cpu=True,
+                max_cache_chunks=args.max_cache_chunks,
+                sampling_steps=args.causal_steps)
+        else:
+            driver = LingBotDriver(ckpt_dir=args.ckpt_dir, size=args.size,
+                                    t5_cpu=True)
 
     chunk = 0
-    print("\n=== LingBot-World Interactive Driving Demo ===")
+    mode_label = "Causal" if args.causal else "Standard"
+    print(f"\n=== LingBot-World Interactive Driving Demo ({mode_label}) ===")
     print("Commands: w/a/s/d (combine: 'wa'), r=reset, q=quit\n")
 
     while True:
@@ -330,6 +414,8 @@ def run_terminal(args):
             break
         if inp == 'r':
             pose_gen.reset()
+            if args.causal and driver is not None:
+                driver.reset()
             print("  Reset to origin.")
             continue
 
@@ -349,13 +435,21 @@ def run_terminal(args):
         else:
             print(f"  Generating {args.frame_num} frames ...")
             t0 = time.time()
-            video, last_frame = driver.generate(
-                image=current_image, prompt=prompt,
-                poses=poses, intrinsics=intrinsics,
-                frame_num=args.frame_num,
-                shift=3.0 if '480' in args.size else 10.0,
-                sampling_steps=args.sample_steps,
-                seed=args.seed + chunk)
+            if args.causal:
+                video, last_frame = driver.generate(
+                    image=current_image, prompt=prompt,
+                    poses=poses, intrinsics=intrinsics,
+                    frame_num=args.frame_num,
+                    shift=3.0 if '480' in args.size else 10.0,
+                    seed=args.seed + chunk)
+            else:
+                video, last_frame = driver.generate(
+                    image=current_image, prompt=prompt,
+                    poses=poses, intrinsics=intrinsics,
+                    frame_num=args.frame_num,
+                    shift=3.0 if '480' in args.size else 10.0,
+                    sampling_steps=args.sample_steps,
+                    seed=args.seed + chunk)
             dt = time.time() - t0
             print(f"  Done in {dt:.1f}s")
 
@@ -406,8 +500,14 @@ def run_pygame(args):
 
     driver = None
     if not args.dry_run:
-        driver = LingBotDriver(ckpt_dir=args.ckpt_dir, size=args.size,
-                                t5_cpu=True)
+        if args.causal:
+            driver = LingBotDriverCausal(
+                ckpt_dir=args.ckpt_dir, size=args.size, t5_cpu=True,
+                max_cache_chunks=args.max_cache_chunks,
+                sampling_steps=args.causal_steps)
+        else:
+            driver = LingBotDriver(ckpt_dir=args.ckpt_dir, size=args.size,
+                                    t5_cpu=True)
 
     frame_buf = deque()
     chunk_idx = 0
@@ -451,13 +551,21 @@ def run_pygame(args):
                 frame_buf.extend([current_surface] * args.frame_num)
                 status = f"Dry: {desc}"
             else:
-                video, last_frame = driver.generate(
-                    image=current_image, prompt=prompt,
-                    poses=poses, intrinsics=intrinsics,
-                    frame_num=args.frame_num,
-                    shift=3.0 if '480' in args.size else 10.0,
-                    sampling_steps=args.sample_steps,
-                    seed=args.seed + chunk_idx)
+                if args.causal:
+                    video, last_frame = driver.generate(
+                        image=current_image, prompt=prompt,
+                        poses=poses, intrinsics=intrinsics,
+                        frame_num=args.frame_num,
+                        shift=3.0 if '480' in args.size else 10.0,
+                        seed=args.seed + chunk_idx)
+                else:
+                    video, last_frame = driver.generate(
+                        image=current_image, prompt=prompt,
+                        poses=poses, intrinsics=intrinsics,
+                        frame_num=args.frame_num,
+                        shift=3.0 if '480' in args.size else 10.0,
+                        sampling_steps=args.sample_steps,
+                        seed=args.seed + chunk_idx)
 
                 if video is not None:
                     import torch
@@ -522,6 +630,12 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--dry_run', action='store_true',
                         help='Test WASD-to-pose without loading model')
+    parser.add_argument('--causal', action='store_true',
+                        help='Use KV-cached causal inference (WanI2VCausal)')
+    parser.add_argument('--max_cache_chunks', type=int, default=4,
+                        help='Max chunks to cache for causal mode')
+    parser.add_argument('--causal_steps', type=int, default=6,
+                        help='Denoising steps for causal mode')
 
     args = parser.parse_args()
 

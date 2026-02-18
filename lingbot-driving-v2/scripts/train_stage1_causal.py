@@ -84,6 +84,11 @@ class CausalPostTrainingConfig:
     log_every: int = 50
     gradient_checkpointing: bool = True
 
+    # W&B
+    wandb_project: str = "lingbot-posttrain"
+    wandb_run_name: str = ""  # auto-generated if empty
+    use_wandb: bool = True
+
 
 # =============================================================================
 # Diffusion forcing utilities
@@ -197,6 +202,11 @@ class Stage1Trainer:
             subfolder=subfolder,
             torch_dtype=torch.bfloat16,
         )
+
+        # Monkey-patch for block causal training (avoids modifying submodule)
+        from model_patches import patch_model_for_block_causal
+        patch_model_for_block_causal(self.model)
+        logger.info("Applied block causal monkey-patch")
 
         # Enable gradient checkpointing
         if self.config.gradient_checkpointing:
@@ -536,6 +546,19 @@ class Stage1Trainer:
         self.setup_optimizer()
         self.setup_data()
 
+        # W&B init (rank 0 only)
+        if self.config.use_wandb and self.rank == 0:
+            import wandb
+            run_name = self.config.wandb_run_name or f"stage1-{self.config.total_steps}steps"
+            wandb.init(
+                project=self.config.wandb_project,
+                name=run_name,
+                config=vars(self.config),
+            )
+            self._wandb = wandb
+        else:
+            self._wandb = None
+
         start_step = 0
         if resume_path and os.path.exists(resume_path):
             start_step = self.load_checkpoint(resume_path)
@@ -544,6 +567,7 @@ class Stage1Trainer:
         running_loss = 0.0
         running_cf_loss = 0.0
         step_times = []
+        grad_norm = None
 
         self.optimizer.zero_grad()
 
@@ -578,7 +602,7 @@ class Stage1Trainer:
             running_cf_loss += cf_loss.item()
 
             if (step + 1) % self.config.gradient_accumulation == 0:
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.config.max_grad_norm,
                 )
@@ -604,6 +628,17 @@ class Stage1Trainer:
                     f"Loss: {avg_loss:.4f} | CF: {avg_cf:.4f} | "
                     f"LR: {lr:.2e} | Step: {avg_time:.1f}s | ETA: {eta_h:.1f}h"
                 )
+
+                if self._wandb is not None:
+                    log_dict = {
+                        "loss": avg_loss,
+                        "cache_fill_loss": avg_cf,
+                        "lr": lr,
+                        "step_time": avg_time,
+                        "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
+                    }
+                    self._wandb.log(log_dict, step=step + 1)
+
                 running_loss = 0.0
                 running_cf_loss = 0.0
 
@@ -613,6 +648,9 @@ class Stage1Trainer:
 
         # Final checkpoint
         self.save_checkpoint(self.config.total_steps)
+
+        if self._wandb is not None:
+            self._wandb.finish()
 
         if self.world_size > 1:
             dist.destroy_process_group()
@@ -644,6 +682,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="lingbot-posttrain")
+    parser.add_argument("--no_wandb", action="store_true")
 
     args = parser.parse_args()
 
@@ -669,6 +709,8 @@ def main():
         chunk_lat_frames=args.chunk_lat_frames,
         seed=args.seed,
         gradient_checkpointing=not args.no_gradient_checkpointing,
+        wandb_project=args.wandb_project,
+        use_wandb=not args.no_wandb,
     )
 
     trainer = Stage1Trainer(config)

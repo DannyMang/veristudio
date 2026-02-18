@@ -64,6 +64,7 @@ image = (
         "ftfy",
         "regex",
         "opencv-python-headless",
+        "wandb",
     )
     .pip_install(
         "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/"
@@ -146,6 +147,7 @@ def preprocess(num_frames: int = 17, resolution: int = 480):
         "/posttrain-data": data_volume,
         "/checkpoints": checkpoint_volume,
     },
+    secrets=[modal.Secret.from_name("wandb-secret")],
     memory=64 * 1024,
 )
 def train_stage1(
@@ -160,6 +162,8 @@ def train_stage1(
     log_every: int = 50,
     seed: int = 42,
     resume_step: int = 0,
+    wandb_project: str = "lingbot-posttrain",
+    use_wandb: bool = True,
 ):
     """Run Stage 1 causal adaptation on 8xH100."""
     import logging
@@ -197,6 +201,8 @@ def train_stage1(
         num_chunks=num_chunks,
         chunk_lat_frames=chunk_lat_frames,
         seed=seed,
+        wandb_project=wandb_project,
+        use_wandb=use_wandb,
     )
 
     resume_path = None
@@ -225,6 +231,7 @@ def train_stage1(
         "/posttrain-data": data_volume,
         "/checkpoints": checkpoint_volume,
     },
+    secrets=[modal.Secret.from_name("wandb-secret")],
     memory=64 * 1024,
 )
 def train_stage2(
@@ -242,6 +249,8 @@ def train_stage2(
     seed: int = 42,
     resume_step: int = 0,
     stage1_ckpt: str = "",
+    wandb_project: str = "lingbot-posttrain",
+    use_wandb: bool = True,
 ):
     """Run Stage 2 DMD distillation on 8xH100."""
     import logging
@@ -284,6 +293,8 @@ def train_stage2(
         chunk_lat_frames=chunk_lat_frames,
         rollout_chunks=rollout_chunks,
         seed=seed,
+        wandb_project=wandb_project,
+        use_wandb=use_wandb,
     )
 
     resume_path = None
@@ -376,6 +387,8 @@ def main(
     seed: int = 42,
     resume_step: int = 0,
     dry_run: bool = False,
+    wandb_project: str = "lingbot-posttrain",
+    use_wandb: bool = True,
 ):
     """
     Post-training pipeline on Modal.
@@ -424,6 +437,8 @@ def main(
             save_every=s1_save,
             seed=seed,
             resume_step=resume_step,
+            wandb_project=wandb_project,
+            use_wandb=use_wandb,
         )
         print("Stage 1 complete!")
         return
@@ -448,6 +463,8 @@ def main(
             seed=seed,
             resume_step=resume_step,
             stage1_ckpt=s2_stage1_ckpt,
+            wandb_project=wandb_project,
+            use_wandb=use_wandb,
         )
         print("Stage 2 complete!")
         return

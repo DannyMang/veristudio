@@ -227,6 +227,7 @@ def evaluate_checkpoint(
     num_samples=5,
     sampling_steps=4,
     seed=42,
+    use_wandb=False,
 ):
     """Full evaluation pipeline.
 
@@ -247,6 +248,21 @@ def evaluate_checkpoint(
     logger.info(f"Checkpoint: {checkpoint_path}")
     logger.info(f"Samples: {num_samples}, Steps: {sampling_steps}")
     logger.info("=" * 60)
+
+    # W&B init
+    _wandb = None
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project="lingbot-posttrain",
+            name=f"eval-{os.path.basename(checkpoint_path)}",
+            config={
+                "checkpoint": checkpoint_path,
+                "num_samples": num_samples,
+                "sampling_steps": sampling_steps,
+            },
+        )
+        _wandb = wandb
 
     # Load model
     model = load_student_model(model_dir, checkpoint_path, device, sampling_steps)
@@ -310,7 +326,19 @@ def evaluate_checkpoint(
         # Save video
         sample_dir = os.path.join(output_dir, f"sample_{i:03d}")
         save_video_frames(video, sample_dir)
-        save_video_mp4(video, os.path.join(sample_dir, "video.mp4"))
+        mp4_path = os.path.join(sample_dir, "video.mp4")
+        save_video_mp4(video, mp4_path)
+
+        # W&B per-sample logging
+        if _wandb is not None:
+            log_dict = {
+                f"sample_{i}/lpips": lpips_score,
+                f"sample_{i}/temporal_coherence": temporal_coh,
+                f"sample_{i}/time_s": elapsed,
+            }
+            if os.path.exists(mp4_path):
+                log_dict[f"sample_{i}/video"] = _wandb.Video(mp4_path)
+            _wandb.log(log_dict)
 
     # Summary
     logger.info("\n" + "=" * 60)
@@ -342,6 +370,15 @@ def evaluate_checkpoint(
     with open(os.path.join(output_dir, "eval_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
+    # W&B summary
+    if _wandb is not None:
+        _wandb.log({
+            "avg_lpips": float(avg_lpips),
+            "avg_temporal_coherence": float(avg_temporal),
+            "avg_time_s": float(avg_time),
+        })
+        _wandb.finish()
+
     logger.info(f"\nResults saved to {output_dir}")
 
 
@@ -361,6 +398,7 @@ def main():
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--sampling_steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--wandb", action="store_true", help="Log results to W&B")
 
     args = parser.parse_args()
 
@@ -377,6 +415,7 @@ def main():
         num_samples=args.num_samples,
         sampling_steps=args.sampling_steps,
         seed=args.seed,
+        use_wandb=args.wandb,
     )
 
 

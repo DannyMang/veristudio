@@ -93,6 +93,11 @@ class DMDConfig:
     log_every: int = 50
     gradient_checkpointing: bool = True
 
+    # W&B
+    wandb_project: str = "lingbot-posttrain"
+    wandb_run_name: str = ""
+    use_wandb: bool = True
+
 
 # =============================================================================
 # Discriminator head (cross-attention based, Fig. 6b)
@@ -440,6 +445,11 @@ class Stage2Trainer:
             torch_dtype=torch.bfloat16,
         )
 
+        # Monkey-patch for block causal training
+        from model_patches import patch_model_for_block_causal
+        patch_model_for_block_causal(self.student)
+        logger.info("Applied block causal monkey-patch to student")
+
         # Load Stage 1 weights
         if self.config.student_ckpt and os.path.exists(self.config.student_ckpt):
             ckpt = torch.load(
@@ -475,6 +485,9 @@ class Stage2Trainer:
             subfolder=self.wan_cfg.high_noise_checkpoint,
             torch_dtype=torch.bfloat16,
         )
+        patch_model_for_block_causal(fake_model)
+        logger.info("Applied block causal monkey-patch to fake score")
+
         self.fake_score = FakeScoreNetwork(
             fake_model, dim=self.wan_cfg.dim, num_heads=self.wan_cfg.num_heads
         )
@@ -802,6 +815,19 @@ class Stage2Trainer:
         self.setup_optimizers()
         self.setup_data()
 
+        # W&B init (rank 0 only)
+        if self.config.use_wandb and self.rank == 0:
+            import wandb
+            run_name = self.config.wandb_run_name or f"stage2-{self.config.total_steps}steps"
+            wandb.init(
+                project=self.config.wandb_project,
+                name=run_name,
+                config=vars(self.config),
+            )
+            self._wandb = wandb
+        else:
+            self._wandb = None
+
         start_step = 0
         if resume_path and os.path.exists(resume_path):
             start_step = self.load_checkpoint(resume_path)
@@ -873,6 +899,17 @@ class Stage2Trainer:
                     + f" | Step: {avg_time:.1f}s | ETA: {eta_h:.1f}h"
                 )
                 logger.info(log_str)
+
+                if self._wandb is not None:
+                    self._wandb.log({
+                        "dmd_loss": running_metrics["dmd"] / n,
+                        "adv_g_loss": running_metrics["adv_g"] / n,
+                        "fake_score_loss": running_metrics["fake_score"] / n,
+                        "disc_loss": running_metrics["disc"] / n,
+                        "student_lr": self.student_optimizer.param_groups[0]["lr"],
+                        "step_time": avg_time,
+                    }, step=step + 1)
+
                 running_metrics = {k: 0 for k in running_metrics}
 
             # Save
@@ -880,6 +917,9 @@ class Stage2Trainer:
                 self.save_checkpoint(step + 1)
 
         self.save_checkpoint(self.config.total_steps)
+
+        if self._wandb is not None:
+            self._wandb.finish()
 
         if self.world_size > 1:
             dist.destroy_process_group()
@@ -913,6 +953,8 @@ def main():
     parser.add_argument("--rollout_steps", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--wandb_project", type=str, default="lingbot-posttrain")
+    parser.add_argument("--no_wandb", action="store_true")
 
     args = parser.parse_args()
 
@@ -940,6 +982,8 @@ def main():
         rollout_chunks=args.rollout_chunks,
         rollout_steps=args.rollout_steps,
         seed=args.seed,
+        wandb_project=args.wandb_project,
+        use_wandb=not args.no_wandb,
     )
 
     trainer = Stage2Trainer(config)

@@ -11,7 +11,7 @@ Each .pt file on disk:
         "context":    bfloat16 (512, 4096),
         "c2ws":       float32  (T_vid, 4, 4),
         "intrinsics": float32  (T_vid, 4),
-        "y":          bfloat16 (17, T_lat, H_lat, W_lat),  # first-frame mask + VAE cond
+        "y":          bfloat16 (20, T_lat, H_lat, W_lat),  # 4-ch mask + 16-ch VAE cond
     }
 
 Usage:
@@ -90,7 +90,7 @@ class PostTrainingDataset(Dataset):
         context = data["context"]  # (512, 4096) bf16
         c2ws = data["c2ws"]  # (T_vid, 4, 4) fp32
         intrinsics = data["intrinsics"]  # (T_vid, 4) fp32
-        y = data["y"]  # (17, T_lat, H_lat, W_lat) bf16
+        y = data["y"]  # (20, T_lat, H_lat, W_lat) bf16
 
         T_lat = latents.shape[1]
         T_use = min(self.total_lat_frames, T_lat)
@@ -352,8 +352,8 @@ class PreprocessPipeline:
             ).to(self.device)
             latents = self.vae.encode([img_cond])[0]  # (16, T_lat, H_lat, W_lat)
 
-            # Build y = mask + VAE-encoded first-frame conditioning
-            y = torch.cat([msk, latents], dim=0)  # (17, T_lat, H_lat, W_lat)
+            # Build y = 4-ch mask + 16-ch VAE-encoded first-frame conditioning
+            y = torch.cat([msk, latents], dim=0)  # (20, T_lat, H_lat, W_lat)
 
             # Encode the actual video (training target)
             video_latents = self.vae.encode([video.to(self.device)])[0]
@@ -367,6 +367,111 @@ class PreprocessPipeline:
             "context": ctx.to(torch.bfloat16).cpu(),
             "c2ws": c2ws.cpu(),
             "intrinsics": intrinsics.cpu(),
+            "y": y.to(torch.bfloat16).cpu(),
+        }
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        torch.save(sample, output_path)
+        return sample
+
+    def encode_clip_from_arrays(
+        self, frames, c2ws, intrinsics, output_path, caption=None,
+        num_frames=81, resolution=480,
+    ):
+        """Encode a clip from in-memory numpy arrays (no disk I/O for input).
+
+        This is the Waymo-friendly path: reads frames directly from memory
+        instead of PNG files on disk, avoiding the inode-heavy raw_clips step.
+
+        Args:
+            frames: list of np.ndarray (H, W, 3) uint8 RGB images.
+            c2ws: np.ndarray (N, 4, 4) float32 camera-to-world matrices.
+            intrinsics: np.ndarray (N, 4) float32 [fx, fy, cx, cy].
+            output_path: Where to save the .pt file.
+            caption: Text description. Defaults to generic driving prompt.
+            num_frames: Number of video frames to use (must be 4n+1).
+            resolution: Target height (480 or 720).
+        """
+        import cv2
+
+        self._load_models()
+
+        if caption is None:
+            caption = (
+                "A front-facing dashcam view of an autonomous vehicle "
+                "driving through urban and suburban environments."
+            )
+
+        # Trim / pad to num_frames
+        if len(frames) > num_frames:
+            frames = frames[:num_frames]
+        while len(frames) < num_frames:
+            frames.append(frames[-1])
+
+        c2ws_t = torch.from_numpy(c2ws[:num_frames]).float()
+        intrinsics_t = torch.from_numpy(intrinsics[:num_frames]).float()
+
+        # Resolution
+        res_map = {320: (320, 576), 480: (480, 832), 720: (720, 1280)}
+        h, w = res_map.get(resolution, (480, 832))
+
+        vae_stride = self.cfg.vae_stride
+        patch_size = self.cfg.patch_size
+
+        lat_h = round(
+            np.sqrt(h * w * (h / w)) // vae_stride[1] // patch_size[1]
+            * patch_size[1]
+        )
+        lat_w = round(
+            np.sqrt(h * w / (h / w)) // vae_stride[2] // patch_size[2]
+            * patch_size[2]
+        )
+        h = lat_h * vae_stride[1]
+        w = lat_w * vae_stride[2]
+
+        # Resize and normalise frames
+        processed = []
+        for frame in frames[:num_frames]:
+            img = cv2.resize(frame, (w, h))
+            img = img.astype(np.float32) / 127.5 - 1.0
+            processed.append(torch.from_numpy(img).permute(2, 0, 1))
+
+        video = torch.stack(processed, dim=1)  # (3, T, H, W)
+
+        F_frames = num_frames
+        lat_f = (F_frames - 1) // vae_stride[0] + 1
+
+        # First-frame mask
+        msk = torch.ones(1, F_frames, lat_h, lat_w, device=self.device)
+        msk[:, 1:] = 0
+        msk = torch.cat(
+            [
+                torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1),
+                msk[:, 1:],
+            ],
+            dim=1,
+        )
+        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+        msk = msk.transpose(1, 2)[0]
+
+        with torch.no_grad():
+            first_frame = video[:, 0:1]
+            img_cond = torch.cat(
+                [first_frame, torch.zeros(3, F_frames - 1, h, w)], dim=1
+            ).to(self.device)
+            latents = self.vae.encode([img_cond])[0]
+
+            y = torch.cat([msk, latents], dim=0)
+
+            video_latents = self.vae.encode([video.to(self.device)])[0]
+
+            ctx = self.t5([caption], self.device)[0]
+
+        sample = {
+            "latents": video_latents.to(torch.bfloat16).cpu(),
+            "context": ctx.to(torch.bfloat16).cpu(),
+            "c2ws": c2ws_t.cpu(),
+            "intrinsics": intrinsics_t.cpu(),
             "y": y.to(torch.bfloat16).cpu(),
         }
 

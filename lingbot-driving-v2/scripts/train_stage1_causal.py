@@ -203,26 +203,15 @@ class Stage1Trainer:
             torch_dtype=torch.bfloat16,
         )
 
+        # Log total parameter count before wrapping
+        total_params = sum(p.numel() for p in self.model.parameters())
+        model_size_gb = total_params * 2 / 1e9  # bf16
+        logger.info(f"Model loaded: {total_params/1e9:.2f}B params ({model_size_gb:.1f} GB in bf16)")
+
         # Monkey-patch for block causal training (avoids modifying submodule)
         from model_patches import patch_model_for_block_causal
         patch_model_for_block_causal(self.model)
         logger.info("Applied block causal monkey-patch")
-
-        # Enable gradient checkpointing
-        if self.config.gradient_checkpointing:
-            from torch.utils.checkpoint import checkpoint as ckpt_fn
-
-            for block in self.model.blocks:
-                orig = block.forward
-                block._original_forward = orig
-
-                def _make(o):
-                    def f(*a, **kw):
-                        return ckpt_fn(o, *a, use_reentrant=False, **kw)
-                    return f
-
-                block.forward = _make(orig)
-            logger.info("Gradient checkpointing enabled")
 
         # Full-parameter training
         self.model.train()
@@ -231,6 +220,8 @@ class Stage1Trainer:
 
         # FSDP wrapping
         if self.world_size > 1:
+            from functools import partial
+
             from torch.distributed.fsdp import (
                 FullyShardedDataParallel as FSDP,
                 MixedPrecision,
@@ -241,7 +232,8 @@ class Stage1Trainer:
             wan_root_mod = __import__("wan.modules.model", fromlist=["WanAttentionBlock"])
             WanAttentionBlock = wan_root_mod.WanAttentionBlock
 
-            auto_wrap_policy = transformer_auto_wrap_policy(
+            auto_wrap_policy = partial(
+                transformer_auto_wrap_policy,
                 transformer_layer_cls={WanAttentionBlock},
             )
             mp = MixedPrecision(
@@ -255,10 +247,70 @@ class Stage1Trainer:
                 mixed_precision=mp,
                 sharding_strategy=ShardingStrategy.FULL_SHARD,
                 device_id=self.local_rank,
+                use_orig_params=True,
+                limit_all_gathers=True,
+                forward_prefetch=False,
             )
             logger.info(f"FSDP wrapped with {self.world_size} GPUs")
+
+            # Verify sharding: count local params to ensure FSDP is distributing
+            local_params = sum(p.numel() for p in self.model.parameters())
+            logger.info(
+                f"Local param count after FSDP: {local_params/1e9:.2f}B "
+                f"(expect ~{local_params * self.world_size / 1e9:.1f}B total)"
+            )
+
+            # FSDP-aware activation checkpointing — must be applied AFTER FSDP
+            # wrapping. Manual checkpoint wrapping before FSDP causes the
+            # SavedTensorHooks to keep all-gathered params alive across all
+            # blocks (~36 GB leaked), defeating FSDP's memory management.
+            if self.config.gradient_checkpointing:
+                from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                    CheckpointImpl,
+                    apply_activation_checkpointing,
+                    checkpoint_wrapper,
+                )
+
+                non_reentrant_wrapper = partial(
+                    checkpoint_wrapper,
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                )
+                apply_activation_checkpointing(
+                    self.model,
+                    checkpoint_wrapper_fn=non_reentrant_wrapper,
+                    check_fn=lambda module: isinstance(module, WanAttentionBlock),
+                )
+
+                # Verify checkpointing was actually applied
+                from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                    CheckpointWrapper,
+                )
+
+                ckpt_count = sum(
+                    1 for m in self.model.modules()
+                    if isinstance(m, CheckpointWrapper)
+                )
+                logger.info(
+                    f"FSDP-aware activation checkpointing enabled: "
+                    f"{ckpt_count} CheckpointWrapper modules (expect 40)"
+                )
         else:
             self.model.to(self.device)
+
+            # Single-GPU gradient checkpointing (no FSDP interaction)
+            if self.config.gradient_checkpointing:
+                from torch.utils.checkpoint import checkpoint as ckpt_fn
+
+                for block in self.model.blocks:
+                    orig = block.forward
+
+                    def _make(o):
+                        def f(*a, **kw):
+                            return ckpt_fn(o, *a, use_reentrant=False, **kw)
+                        return f
+
+                    block.forward = _make(orig)
+                logger.info("Gradient checkpointing enabled (single GPU)")
 
         # Compute chunk token size for block causal
         vae_stride = self.wan_cfg.vae_stride
@@ -286,6 +338,23 @@ class Stage1Trainer:
             f"lat_h={lat_h}, lat_w={lat_w}"
         )
 
+        # GPU memory diagnostics
+        if self.rank == 0:
+            self._log_gpu_memory("after model setup")
+
+    def _log_gpu_memory(self, label=""):
+        """Log GPU memory usage for diagnostics."""
+        if not torch.cuda.is_available():
+            return
+        alloc = torch.cuda.memory_allocated(self.device) / 1e9
+        reserved = torch.cuda.memory_reserved(self.device) / 1e9
+        max_alloc = torch.cuda.max_memory_allocated(self.device) / 1e9
+        logger.info(
+            f"GPU mem [{label}]: "
+            f"alloc={alloc:.2f} GB, reserved={reserved:.2f} GB, "
+            f"peak={max_alloc:.2f} GB"
+        )
+
     def setup_optimizer(self):
         """Configure AdamW optimizer with cosine LR schedule."""
         self.optimizer = torch.optim.AdamW(
@@ -308,6 +377,9 @@ class Stage1Trainer:
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda
         )
+
+        if self.rank == 0:
+            self._log_gpu_memory("after optimizer init")
 
     def setup_data(self):
         """Set up dataset and dataloader."""
@@ -343,12 +415,17 @@ class Stage1Trainer:
         """
         latents = batch["latents"].to(self.device)  # (B, C, T_lat, H, W) bf16
         context = batch["context"].to(self.device)  # (B, 512, 4096) bf16
-        y = batch["y"].to(self.device)  # (B, 17, T_lat, H, W) bf16
+        y = batch["y"].to(self.device)  # (B, 20, T_lat, H, W) bf16
         plucker_emb = batch["plucker_emb"].to(self.device)  # (B, C_p, T_lat, H, W)
 
-        B = latents.shape[0]
-        T_lat = latents.shape[2]
+        B, C, T_lat, H_lat, W_lat = latents.shape
         num_chunks = T_lat // self.config.chunk_lat_frames
+
+        # Derive token counts from actual data dimensions (avoids FP mismatch)
+        patch_h, patch_w = self.wan_cfg.patch_size[1], self.wan_cfg.patch_size[2]
+        tokens_per_lat_frame = (H_lat // patch_h) * (W_lat // patch_w)
+        tokens_per_chunk = tokens_per_lat_frame * self.config.chunk_lat_frames
+        seq_len = num_chunks * tokens_per_chunk
 
         # Sample per-chunk timesteps from target set
         chunk_ts = sample_diffusion_forcing_timesteps(
@@ -363,14 +440,9 @@ class Stage1Trainer:
             self.config.num_train_timesteps,
         )
 
-        # Build per-token timestep tensor
-        # Each latent frame in a chunk gets the same timestep
-        tokens_per_chunk = self.chunk_size_tokens
-        seq_len = num_chunks * tokens_per_chunk
-
         # Expand chunk timesteps to per-token
         frame_ts = chunk_ts.repeat_interleave(self.config.chunk_lat_frames, dim=1)
-        token_ts = frame_ts.repeat_interleave(self.tokens_per_lat_frame, dim=1)
+        token_ts = frame_ts.repeat_interleave(tokens_per_lat_frame, dim=1)
 
         # Prepare model inputs
         x_list = [noisy_latents[b] for b in range(B)]
@@ -392,7 +464,7 @@ class Stage1Trainer:
                 y=y_list,
                 dit_cond_dict=dit_cond_dict,
                 block_causal=True,
-                chunk_size_tokens=self.chunk_size_tokens,
+                chunk_size_tokens=tokens_per_chunk,
             )
 
         # Flow matching velocity loss: v_target = noise - x_0
@@ -418,12 +490,16 @@ class Stage1Trainer:
         y = batch["y"].to(self.device)
         plucker_emb = batch["plucker_emb"].to(self.device)
 
-        B = latents.shape[0]
-        T_lat = latents.shape[2]
+        B, C, T_lat, H_lat, W_lat = latents.shape
         clf = self.config.chunk_lat_frames
 
         if T_lat < 2 * clf:
             return torch.tensor(0.0, device=self.device)
+
+        # Derive token counts from actual data dimensions
+        patch_h, patch_w = self.wan_cfg.patch_size[1], self.wan_cfg.patch_size[2]
+        tokens_per_lat_frame = (H_lat // patch_h) * (W_lat // patch_w)
+        seq_per_chunk = tokens_per_lat_frame * clf
 
         # Split into first chunk (clean) and second chunk (noisy)
         first_chunk = latents[:, :, :clf]
@@ -431,7 +507,7 @@ class Stage1Trainer:
 
         # Add noise to second chunk at a random timestep
         t_val = torch.randint(
-            100, self.config.num_train_timesteps, (B, 1), device=self.device
+            1, self.config.num_train_timesteps, (B, 1), device=self.device
         )
         sigma = t_val.float() / self.config.num_train_timesteps
         noise_2 = torch.randn_like(second_chunk)
@@ -444,7 +520,6 @@ class Stage1Trainer:
         combined = torch.cat([first_chunk, noisy_2], dim=2)  # (B, C, 2*clf, H, W)
 
         # Build timesteps: t=0 for first chunk, t_val for second
-        seq_per_chunk = self.chunk_size_tokens
         seq_len = 2 * seq_per_chunk
 
         t0_tokens = torch.zeros(B, seq_per_chunk, device=self.device, dtype=torch.long)
@@ -468,7 +543,7 @@ class Stage1Trainer:
                 y=y_list,
                 dit_cond_dict=dit_cond_dict,
                 block_causal=True,
-                chunk_size_tokens=self.chunk_size_tokens,
+                chunk_size_tokens=seq_per_chunk,
             )
 
         # Loss only on the second chunk (the denoised part)
@@ -484,31 +559,45 @@ class Stage1Trainer:
         return loss
 
     def save_checkpoint(self, step):
-        """Save training checkpoint."""
-        if self.rank != 0:
-            return
+        """Save training checkpoint.
 
+        With FSDP, all ranks must participate in state dict gathering.
+        Only rank 0 writes to disk.
+        """
         os.makedirs(self.config.output_dir, exist_ok=True)
 
-        # Get model state dict (handles FSDP)
+        # Gather state dicts (collective operation — all ranks must participate)
         if self.world_size > 1:
             from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+                FullOptimStateDictConfig,
                 FullStateDictConfig,
                 StateDictType,
             )
 
-            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with self.model.state_dict_type(
-                self.model, StateDictType.FULL_STATE_DICT, save_policy
+            model_cfg = FullStateDictConfig(
+                offload_to_cpu=True, rank0_only=True
+            )
+            optim_cfg = FullOptimStateDictConfig(
+                offload_to_cpu=True, rank0_only=True
+            )
+            with FSDP.state_dict_type(
+                self.model, StateDictType.FULL_STATE_DICT, model_cfg, optim_cfg
             ):
                 state_dict = self.model.state_dict()
+                optim_sd = FSDP.optim_state_dict(self.model, self.optimizer)
         else:
             state_dict = self.model.state_dict()
+            optim_sd = self.optimizer.state_dict()
+
+        # Only rank 0 writes to disk
+        if self.rank != 0:
+            return
 
         checkpoint = {
             "step": step,
             "model_state_dict": state_dict,
-            "optimizer_state_dict": self.optimizer.state_dict(),
+            "optimizer_state_dict": optim_sd,
             "scheduler_state_dict": self.scheduler.state_dict(),
             "config": vars(self.config),
         }
@@ -524,16 +613,31 @@ class Stage1Trainer:
         logger.info(f"Saved checkpoint step {step} -> {path} ({size_gb:.1f} GB)")
 
     def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint and return starting step."""
+        """Load checkpoint and return starting step (handles FSDP)."""
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-        model = self.model
-        if hasattr(model, "module"):
-            model = model.module
-        model.load_state_dict(ckpt["model_state_dict"])
+        if self.world_size > 1:
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+                StateDictType,
+            )
 
-        if "optimizer_state_dict" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            with FSDP.state_dict_type(
+                self.model, StateDictType.FULL_STATE_DICT
+            ):
+                self.model.load_state_dict(ckpt["model_state_dict"])
+
+            if "optimizer_state_dict" in ckpt:
+                osd = FSDP.optim_state_dict_to_load(
+                    self.model, self.optimizer,
+                    ckpt["optimizer_state_dict"],
+                )
+                self.optimizer.load_state_dict(osd)
+        else:
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            if "optimizer_state_dict" in ckpt:
+                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
         if "scheduler_state_dict" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
 
@@ -571,6 +675,12 @@ class Stage1Trainer:
 
         self.optimizer.zero_grad()
 
+        # Clear any residual GPU memory from setup and reset peak stats
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(self.device)
+        if self.rank == 0:
+            self._log_gpu_memory("before training loop")
+
         logger.info(
             f"Starting Stage 1 training: steps {start_step}-{self.config.total_steps}, "
             f"batch={self.config.batch_size}, grad_accum={self.config.gradient_accumulation}, "
@@ -586,17 +696,35 @@ class Stage1Trainer:
                 data_iter = iter(self.dataloader)
                 batch = next(data_iter)
 
-            # Main diffusion forcing loss
-            loss = self.train_step(batch)
+            # Log data shapes and pre-forward memory on first step
+            if step == start_step and self.rank == 0:
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        logger.info(f"  batch[{k}]: {v.shape} {v.dtype}")
+                self._log_gpu_memory("before first forward")
 
-            # Cache-fill loss (every 4th step to save compute)
+            # Main diffusion forcing loss — backward immediately so the
+            # computation graph is freed before cache_fill_step creates a
+            # second one.  Keeping both graphs alive doubles peak activation
+            # memory (~40 GB each → 80 GB total → OOM on H100).
+            loss = self.train_step(batch)
+            scaled_loss = loss / self.config.gradient_accumulation
+            scaled_loss.backward()
+
+            if self.rank == 0 and step == start_step:
+                self._log_gpu_memory("after train_step backward")
+
+            # Cache-fill loss (every 4th step, separate backward to avoid
+            # dual-graph OOM).  Gradients accumulate correctly because we
+            # haven't called zero_grad() yet.
             cf_loss = torch.tensor(0.0, device=self.device)
             if step % 4 == 0:
                 cf_loss = self.cache_fill_step(batch)
-                loss = loss + 0.1 * cf_loss  # Weight cache-fill loss lower
+                scaled_cf = 0.1 * cf_loss / self.config.gradient_accumulation
+                scaled_cf.backward()
 
-            scaled_loss = loss / self.config.gradient_accumulation
-            scaled_loss.backward()
+                if self.rank == 0 and step == start_step:
+                    self._log_gpu_memory("after cache_fill backward")
 
             running_loss += loss.item()
             running_cf_loss += cf_loss.item()
@@ -613,7 +741,16 @@ class Stage1Trainer:
             step_time = time.time() - step_t0
             step_times.append(step_time)
 
-            # Logging
+            # Per-step logging for short runs
+            if self.rank == 0 and self.config.total_steps <= 20:
+                logger.info(
+                    f"Step {step+1}/{self.config.total_steps} | "
+                    f"Loss: {loss.item():.4f} | CF: {cf_loss.item():.4f} | "
+                    f"Time: {step_time:.2f}s"
+                )
+                self._log_gpu_memory(f"step {step+1}")
+
+            # Periodic logging for full runs
             if (step + 1) % self.config.log_every == 0 and self.rank == 0:
                 avg_loss = running_loss / self.config.log_every
                 avg_cf = running_cf_loss / self.config.log_every

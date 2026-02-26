@@ -59,7 +59,7 @@ class DMDConfig:
     resolution: int = 480
 
     # Training
-    total_steps: int = 100000
+    total_steps: int = 50000
     batch_size: int = 1
     gradient_accumulation: int = 4
     student_lr: float = 1e-5
@@ -74,7 +74,6 @@ class DMDConfig:
     # DMD
     dmd_weight: float = 1.0
     adv_weight: float = 0.1
-    disc_update_ratio: int = 2  # update fake_score N times per student update
 
     # Self-rollout
     rollout_chunks: int = 3  # how many chunks to generate in self-rollout
@@ -424,6 +423,22 @@ class Stage2Trainer:
         if self.world_size > 1:
             dist.init_process_group("nccl")
 
+    @staticmethod
+    def _apply_gradient_checkpointing(model):
+        """Wrap each block's forward with activation checkpointing."""
+        from torch.utils.checkpoint import checkpoint as ckpt_fn
+
+        for block in model.blocks:
+            orig = block.forward
+            block._original_forward = orig
+
+            def _make(o):
+                def f(*a, **kw):
+                    return ckpt_fn(o, *a, use_reentrant=False, **kw)
+                return f
+
+            block.forward = _make(orig)
+
     def setup_models(self):
         """Load student, teacher, and fake score models."""
         wan_root = os.path.join(
@@ -458,25 +473,13 @@ class Stage2Trainer:
             self.student.load_state_dict(ckpt["model_state_dict"])
             logger.info(f"Loaded Stage 1 checkpoint from step {ckpt['step']}")
 
-        # Enable gradient checkpointing
+        # Enable gradient checkpointing for student
         if self.config.gradient_checkpointing:
-            from torch.utils.checkpoint import checkpoint as ckpt_fn
-
-            for block in self.student.blocks:
-                orig = block.forward
-                block._original_forward = orig
-
-                def _make(o):
-                    def f(*a, **kw):
-                        return ckpt_fn(o, *a, use_reentrant=False, **kw)
-                    return f
-
-                block.forward = _make(orig)
+            self._apply_gradient_checkpointing(self.student)
 
         self.student.train()
         for p in self.student.parameters():
             p.requires_grad = True
-        self.student.to(self.device)
 
         # ----- Fake Score Network -----
         logger.info("Loading fake score network...")
@@ -488,13 +491,60 @@ class Stage2Trainer:
         patch_model_for_block_causal(fake_model)
         logger.info("Applied block causal monkey-patch to fake score")
 
+        if self.config.gradient_checkpointing:
+            self._apply_gradient_checkpointing(fake_model)
+
         self.fake_score = FakeScoreNetwork(
             fake_model, dim=self.wan_cfg.dim, num_heads=self.wan_cfg.num_heads
         )
         self.fake_score.train()
         for p in self.fake_score.parameters():
             p.requires_grad = True
-        self.fake_score.to(self.device)
+
+        # ----- FSDP wrapping or simple device placement -----
+        self._use_fsdp = self.world_size > 1
+        if self._use_fsdp:
+            from functools import partial as functools_partial
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+                MixedPrecision,
+                ShardingStrategy,
+            )
+            from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+
+            mp_policy = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
+            # Wrap submodules > 100M params (each attention block is ~350M)
+            auto_wrap = functools_partial(
+                size_based_auto_wrap_policy, min_num_params=100_000_000,
+            )
+
+            self.student = FSDP(
+                self.student,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                mixed_precision=mp_policy,
+                auto_wrap_policy=auto_wrap,
+                device_id=self.local_rank,
+                use_orig_params=True,
+            )
+            logger.info("FSDP-wrapped student (FULL_SHARD, per-block)")
+
+            self.fake_score.model = FSDP(
+                self.fake_score.model,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                mixed_precision=mp_policy,
+                auto_wrap_policy=auto_wrap,
+                device_id=self.local_rank,
+                use_orig_params=True,
+            )
+            self.fake_score.discriminator.to(self.device)
+            logger.info("FSDP-wrapped fake score backbone (FULL_SHARD, per-block)")
+        else:
+            self.student.to(self.device)
+            self.fake_score.to(self.device)
 
         # ----- Teacher (frozen, CPU-offloaded) -----
         logger.info("Loading teacher (both experts, frozen)...")
@@ -541,7 +591,11 @@ class Stage2Trainer:
         )
 
     def setup_optimizers(self):
-        """Set up separate optimizers for student and fake score."""
+        """Set up separate optimizers for student, fake backbone, and discriminator.
+
+        Per the paper: adversarial loss updates ONLY the discriminator head D,
+        while the fake score backbone μ_fake is updated solely with the DMD loss.
+        """
         # Student optimizer
         self.student_optimizer = torch.optim.AdamW(
             self.student.parameters(),
@@ -550,15 +604,23 @@ class Stage2Trainer:
             weight_decay=self.config.weight_decay,
         )
 
-        # Fake score + discriminator optimizer
-        self.fake_optimizer = torch.optim.AdamW(
-            self.fake_score.parameters(),
+        # Fake score backbone optimizer (DMD score matching loss only)
+        self.fake_backbone_optimizer = torch.optim.AdamW(
+            self.fake_score.model.parameters(),
             lr=self.config.fake_score_lr,
             betas=(0.9, 0.999),
             weight_decay=self.config.weight_decay,
         )
 
-        # Cosine LR schedule for both
+        # Discriminator head optimizer (adversarial loss only)
+        self.disc_optimizer = torch.optim.AdamW(
+            self.fake_score.discriminator.parameters(),
+            lr=self.config.disc_lr,
+            betas=(0.9, 0.999),
+            weight_decay=self.config.weight_decay,
+        )
+
+        # Cosine LR schedule for all three
         def lr_lambda(step):
             if step < self.config.warmup_steps:
                 return step / max(self.config.warmup_steps, 1)
@@ -571,8 +633,11 @@ class Stage2Trainer:
         self.student_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.student_optimizer, lr_lambda
         )
-        self.fake_scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.fake_optimizer, lr_lambda
+        self.fake_backbone_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.fake_backbone_optimizer, lr_lambda
+        )
+        self.disc_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.disc_optimizer, lr_lambda
         )
 
     def setup_data(self):
@@ -585,10 +650,17 @@ class Stage2Trainer:
             chunk_lat_frames=self.config.chunk_lat_frames,
         )
 
+        self._sampler = None
+        if self.world_size > 1:
+            self._sampler = torch.utils.data.distributed.DistributedSampler(
+                self.dataset, num_replicas=self.world_size, rank=self.rank,
+            )
+
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            shuffle=(self._sampler is None),
+            sampler=self._sampler,
             num_workers=4,
             pin_memory=True,
             drop_last=True,
@@ -744,14 +816,15 @@ class Stage2Trainer:
             + self.config.adv_weight * loss_adv_g
         )
 
-        # === 7. Fake score + discriminator update ===
-        # Fake score matching: fake_score should approximate score of student distribution
+        # === 7. Fake score backbone loss (DMD score matching only) ===
+        # Per paper: μ_fake is updated solely with the DMD loss
         fake_score_loss = F.mse_loss(
             torch.stack([p.float() for p in fake_preds]),
             student_v.detach(),
         )
 
-        # Discriminator loss
+        # === 8. Discriminator head loss (adversarial only) ===
+        # Per paper: adversarial loss is used only to update discriminator head D
         teacher_flat = teacher_v.reshape(B, -1, self.wan_cfg.dim).detach()
         student_flat_detached = student_flat.detach()
 
@@ -759,9 +832,7 @@ class Stage2Trainer:
         disc_fake_detached = self.fake_score.discriminate(student_flat_detached)
         loss_disc = adversarial_discriminator_loss(disc_real, disc_fake_detached)
 
-        fake_total_loss = fake_score_loss + loss_disc
-
-        return student_loss, fake_total_loss, {
+        return student_loss, fake_score_loss, loss_disc, {
             "dmd": loss_dmd.item(),
             "adv_g": loss_adv_g.item(),
             "fake_score": fake_score_loss.item(),
@@ -769,18 +840,63 @@ class Stage2Trainer:
         }
 
     def save_checkpoint(self, step):
-        """Save student and fake score checkpoints."""
+        """Save student and fake score checkpoints.
+
+        With FSDP, all ranks must participate in state dict gathering.
+        Only rank 0 writes to disk.
+        """
+        os.makedirs(self.config.output_dir, exist_ok=True)
+
+        if self._use_fsdp:
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+                FullOptimStateDictConfig,
+                FullStateDictConfig,
+                StateDictType,
+            )
+
+            model_cfg = FullStateDictConfig(
+                offload_to_cpu=True, rank0_only=True
+            )
+            optim_cfg = FullOptimStateDictConfig(
+                offload_to_cpu=True, rank0_only=True
+            )
+
+            # Gather student state (collective)
+            with FSDP.state_dict_type(
+                self.student, StateDictType.FULL_STATE_DICT, model_cfg, optim_cfg
+            ):
+                student_sd = self.student.state_dict()
+                student_opt_sd = FSDP.optim_state_dict(
+                    self.student, self.student_optimizer
+                )
+
+            # Gather fake score backbone state (collective)
+            with FSDP.state_dict_type(
+                self.fake_score.model, StateDictType.FULL_STATE_DICT,
+                model_cfg, optim_cfg
+            ):
+                fake_score_sd = self.fake_score.state_dict()
+                fake_backbone_opt_sd = FSDP.optim_state_dict(
+                    self.fake_score.model, self.fake_backbone_optimizer
+                )
+        else:
+            student_sd = self.student.state_dict()
+            fake_score_sd = self.fake_score.state_dict()
+            student_opt_sd = self.student_optimizer.state_dict()
+            fake_backbone_opt_sd = self.fake_backbone_optimizer.state_dict()
+
+        # Only rank 0 writes to disk
         if self.rank != 0:
             return
 
-        os.makedirs(self.config.output_dir, exist_ok=True)
-
         checkpoint = {
             "step": step,
-            "student_state_dict": self.student.state_dict(),
-            "fake_score_state_dict": self.fake_score.state_dict(),
-            "student_optimizer": self.student_optimizer.state_dict(),
-            "fake_optimizer": self.fake_optimizer.state_dict(),
+            "student_state_dict": student_sd,
+            "fake_score_state_dict": fake_score_sd,
+            "student_optimizer": student_opt_sd,
+            "fake_backbone_optimizer": fake_backbone_opt_sd,
+            "disc_optimizer": self.disc_optimizer.state_dict(),
             "config": vars(self.config),
         }
 
@@ -795,16 +911,51 @@ class Stage2Trainer:
         logger.info(f"Saved checkpoint step {step} -> {path} ({size_gb:.1f} GB)")
 
     def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint."""
+        """Load checkpoint (handles both FSDP and non-FSDP)."""
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-        self.student.load_state_dict(ckpt["student_state_dict"])
-        self.fake_score.load_state_dict(ckpt["fake_score_state_dict"])
+        if self._use_fsdp:
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+                StateDictType,
+            )
 
-        if "student_optimizer" in ckpt:
-            self.student_optimizer.load_state_dict(ckpt["student_optimizer"])
-        if "fake_optimizer" in ckpt:
-            self.fake_optimizer.load_state_dict(ckpt["fake_optimizer"])
+            with FSDP.state_dict_type(
+                self.student, StateDictType.FULL_STATE_DICT
+            ):
+                self.student.load_state_dict(ckpt["student_state_dict"])
+
+            with FSDP.state_dict_type(
+                self.fake_score.model, StateDictType.FULL_STATE_DICT
+            ):
+                self.fake_score.load_state_dict(ckpt["fake_score_state_dict"])
+
+            if "student_optimizer" in ckpt:
+                osd = FSDP.optim_state_dict_to_load(
+                    self.student, self.student_optimizer,
+                    ckpt["student_optimizer"],
+                )
+                self.student_optimizer.load_state_dict(osd)
+
+            if "fake_backbone_optimizer" in ckpt:
+                osd = FSDP.optim_state_dict_to_load(
+                    self.fake_score.model, self.fake_backbone_optimizer,
+                    ckpt["fake_backbone_optimizer"],
+                )
+                self.fake_backbone_optimizer.load_state_dict(osd)
+        else:
+            self.student.load_state_dict(ckpt["student_state_dict"])
+            self.fake_score.load_state_dict(ckpt["fake_score_state_dict"])
+
+            if "student_optimizer" in ckpt:
+                self.student_optimizer.load_state_dict(ckpt["student_optimizer"])
+            if "fake_backbone_optimizer" in ckpt:
+                self.fake_backbone_optimizer.load_state_dict(
+                    ckpt["fake_backbone_optimizer"]
+                )
+
+        if "disc_optimizer" in ckpt:
+            self.disc_optimizer.load_state_dict(ckpt["disc_optimizer"])
 
         logger.info(f"Loaded checkpoint from step {ckpt['step']}")
         return ckpt["step"]
@@ -837,7 +988,8 @@ class Stage2Trainer:
         step_times = []
 
         self.student_optimizer.zero_grad()
-        self.fake_optimizer.zero_grad()
+        self.fake_backbone_optimizer.zero_grad()
+        self.disc_optimizer.zero_grad()
 
         logger.info(
             f"Starting Stage 2 DMD training: steps {start_step}-{self.config.total_steps}"
@@ -852,9 +1004,9 @@ class Stage2Trainer:
                 data_iter = iter(self.dataloader)
                 batch = next(data_iter)
 
-            student_loss, fake_loss, metrics = self.train_step(batch)
+            student_loss, fake_backbone_loss, disc_loss, metrics = self.train_step(batch)
 
-            # --- Student update ---
+            # --- Student update (DMD + adversarial generator) ---
             (student_loss / self.config.gradient_accumulation).backward()
 
             if (step + 1) % self.config.gradient_accumulation == 0:
@@ -865,19 +1017,27 @@ class Stage2Trainer:
                 self.student_scheduler.step()
                 self.student_optimizer.zero_grad()
 
-            # --- Fake score + disc update (two-timescale) ---
-            for _ in range(self.config.disc_update_ratio):
-                (fake_loss / self.config.gradient_accumulation).backward(
-                    retain_graph=True
-                )
+            # --- Fake backbone update (score matching loss only) ---
+            (fake_backbone_loss / self.config.gradient_accumulation).backward()
 
             if (step + 1) % self.config.gradient_accumulation == 0:
                 torch.nn.utils.clip_grad_norm_(
-                    self.fake_score.parameters(), self.config.max_grad_norm
+                    self.fake_score.model.parameters(), self.config.max_grad_norm
                 )
-                self.fake_optimizer.step()
-                self.fake_scheduler.step()
-                self.fake_optimizer.zero_grad()
+                self.fake_backbone_optimizer.step()
+                self.fake_backbone_scheduler.step()
+                self.fake_backbone_optimizer.zero_grad()
+
+            # --- Discriminator head update (adversarial loss only) ---
+            (disc_loss / self.config.gradient_accumulation).backward()
+
+            if (step + 1) % self.config.gradient_accumulation == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.fake_score.discriminator.parameters(), self.config.max_grad_norm
+                )
+                self.disc_optimizer.step()
+                self.disc_scheduler.step()
+                self.disc_optimizer.zero_grad()
 
             step_time = time.time() - step_t0
             step_times.append(step_time)
@@ -940,7 +1100,7 @@ def main():
     parser.add_argument("--student_ckpt", required=True, help="Stage 1 checkpoint")
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--total_steps", type=int, default=100000)
+    parser.add_argument("--total_steps", type=int, default=50000)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation", type=int, default=4)
     parser.add_argument("--student_lr", type=float, default=1e-5)
@@ -951,6 +1111,7 @@ def main():
     parser.add_argument("--chunk_lat_frames", type=int, default=5)
     parser.add_argument("--rollout_chunks", type=int, default=3)
     parser.add_argument("--rollout_steps", type=int, default=4)
+    parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--wandb_project", type=str, default="lingbot-posttrain")
@@ -981,6 +1142,7 @@ def main():
         chunk_lat_frames=args.chunk_lat_frames,
         rollout_chunks=args.rollout_chunks,
         rollout_steps=args.rollout_steps,
+        warmup_steps=args.warmup_steps,
         seed=args.seed,
         wandb_project=args.wandb_project,
         use_wandb=not args.no_wandb,

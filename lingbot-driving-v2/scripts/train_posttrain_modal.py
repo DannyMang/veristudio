@@ -78,6 +78,9 @@ image = (
         "ftfy",
         "regex",
         "opencv-python-headless",
+        "fastapi",
+        "uvicorn",
+        "gradio>=5.34.1,<6.0",
         "wandb",
         "pandas",
         "pyarrow",
@@ -863,6 +866,490 @@ def evaluate(
 
 
 # ============================================================================
+# Extract inference-only checkpoint (strips optimizer state)
+# ============================================================================
+
+
+@app.function(
+    image=image,
+    timeout=1800,
+    volumes={"/checkpoints": checkpoint_volume},
+    memory=128 * 1024,
+)
+def extract_inference_ckpt(checkpoint: str = "stage1_step10000.pt"):
+    """Extract model weights only from a training checkpoint (111 GB -> ~28 GB)."""
+    import os
+
+    import torch
+
+    src = os.path.join(CHECKPOINT_DIR, checkpoint)
+    dst = os.path.join(CHECKPOINT_DIR, checkpoint.replace(".pt", "_inference.pt"))
+
+    if os.path.exists(dst):
+        print(f"Inference checkpoint already exists: {dst}")
+        checkpoint_volume.commit()
+        return
+
+    print(f"Loading full checkpoint: {src} ...")
+    ckpt = torch.load(src, map_location="cpu", weights_only=False)
+
+    inference_ckpt = {
+        "step": ckpt["step"],
+        "model_state_dict": ckpt["model_state_dict"],
+    }
+
+    print(f"Saving inference checkpoint: {dst} ...")
+    torch.save(inference_ckpt, dst)
+
+    size_gb = os.path.getsize(dst) / 1e9
+    print(f"Done! {size_gb:.1f} GB (was {os.path.getsize(src) / 1e9:.1f} GB)")
+    checkpoint_volume.commit()
+
+
+# ============================================================================
+# Demo (interactive web UI — plain FastAPI + static HTML)
+# ============================================================================
+
+
+@app.function(
+    image=image,
+    gpu="H100",
+    timeout=3600,
+    volumes={
+        "/data": model_volume,
+        "/posttrain-data": data_volume,
+        "/checkpoints": checkpoint_volume,
+    },
+    memory=128 * 1024,
+    max_containers=1,
+)
+@modal.asgi_app()
+def demo():
+    """Launch a FastAPI demo to try the post-trained model in a browser.
+
+    Plain FastAPI + static HTML — no Gradio, no SSE, no queue.
+    Modal handles vanilla FastAPI perfectly (just request/response).
+    max_containers=1 ensures single instance (global state is safe).
+    """
+    import io
+    import os
+    import sys
+    import time
+
+    import torch
+
+    sys.path.insert(0, "/opt/lingbot-world")
+    sys.path.insert(0, "/opt/lingbot-driving-v2/scripts")
+
+    import numpy as np
+    from fastapi import FastAPI, File, Form, UploadFile
+    from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+    from PIL import Image
+
+    from eval_posttrain import load_student_model, save_video_mp4
+
+    # Configure via env vars or defaults
+    checkpoint = os.environ.get("DEMO_CHECKPOINT", "stage1_step10000.pt")
+    sampling_steps = int(os.environ.get("DEMO_STEPS", "20"))
+
+    # Prefer inference-only checkpoint (28 GB) over full training checkpoint (111 GB)
+    inference_ckpt = checkpoint.replace(".pt", "_inference.pt")
+    if os.path.exists(os.path.join(CHECKPOINT_DIR, inference_ckpt)):
+        checkpoint = inference_ckpt
+    ckpt_path = os.path.join(CHECKPOINT_DIR, checkpoint)
+    print(f"Loading model from {ckpt_path} with {sampling_steps} steps...")
+    # NOTE: compile=False for now — torch.compile interferes with KV cache
+    # state mutations (_cache_valid_len is a Python int mutated in-place by
+    # append_to_cache, which torch.compile may not track across blocks).
+    # Re-enable after verifying chunk-to-chunk quality without compile.
+    model = load_student_model(
+        MODEL_DIR, ckpt_path, torch.device("cuda:0"), sampling_steps,
+        compile=False,
+    )
+    print("Model loaded!")
+
+    # WASD pose generator (inlined from drive_interactive.py to avoid cross-dir import)
+    class DrivingPoseGenerator:
+        def __init__(self, speed=0.3, turn_rate=2.0, num_frames=17):
+            self.speed = speed
+            self.turn_rate_deg = turn_rate
+            self.num_frames = num_frames
+            self.position = np.array([0.0, 0.0, 0.0])
+            self.yaw = 0.0
+            self.current_speed = 0.0
+            self.current_yaw_rate = 0.0
+
+        def _yaw_to_rotation(self, yaw):
+            c, s = np.cos(yaw), np.sin(yaw)
+            return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+        def _make_c2w(self, position, yaw):
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, :3] = self._yaw_to_rotation(yaw)
+            c2w[:3, 3] = position
+            return c2w
+
+        def wasd_to_poses(self, keys_held):
+            target_speed = 0.0
+            target_yaw_rate = 0.0
+            if 'w' in keys_held: target_speed = self.speed
+            if 's' in keys_held: target_speed = -self.speed * 0.5
+            if 'a' in keys_held: target_yaw_rate = -np.radians(self.turn_rate_deg)
+            if 'd' in keys_held: target_yaw_rate = np.radians(self.turn_rate_deg)
+            if not keys_held:
+                target_speed = self.current_speed * 0.8
+                target_yaw_rate = 0.0
+            poses = []
+            for i in range(self.num_frames):
+                t = (i + 1) / self.num_frames
+                self.current_speed += (target_speed - self.current_speed) * t * 0.3
+                self.current_yaw_rate += (target_yaw_rate - self.current_yaw_rate) * t * 0.3
+                self.yaw += self.current_yaw_rate
+                forward = np.array([np.sin(self.yaw), 0.0, np.cos(self.yaw)])
+                self.position = self.position + forward * self.current_speed
+                poses.append(self._make_c2w(self.position.copy(), self.yaw))
+            parts = []
+            if 'w' in keys_held: parts.append("forward")
+            if 's' in keys_held: parts.append("reverse")
+            if 'a' in keys_held: parts.append("left")
+            if 'd' in keys_held: parts.append("right")
+            return np.array(poses, dtype=np.float32), ' + '.join(parts) or 'coast'
+
+        def get_default_intrinsics(self, num_frames, width=832, height=480):
+            fov_h = 70.0
+            fx = width / (2.0 * np.tan(np.radians(fov_h / 2.0)))
+            cx, cy = width / 2.0, height / 2.0
+            return np.tile(np.array([[fx, fx, cx, cy]], dtype=np.float32), (num_frames, 1))
+
+        def reset(self):
+            self.position = np.array([0.0, 0.0, 0.0])
+            self.yaw = 0.0
+            self.current_speed = 0.0
+            self.current_yaw_rate = 0.0
+
+    pose_gen = DrivingPoseGenerator(speed=0.3, turn_rate=2.0, num_frames=17)
+
+    # Persistent state for autoregressive generation
+    state = {
+        "current_image": None,  # PIL Image of last frame
+        "prompt": "",
+        "chunk_idx": 0,
+        "initialized": False,
+    }
+
+    direction_key_map = {
+        "forward": {"w"},
+        "forward_left": {"w", "a"},
+        "forward_right": {"w", "d"},
+        "reverse": {"s"},
+        "coast": set(),
+    }
+
+    web_app = FastAPI()
+
+    # ------------------------------------------------------------------
+    # Static HTML UI
+    # ------------------------------------------------------------------
+
+    INDEX_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LingBot-World Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #111; color: #eee; }
+  h1 { text-align: center; padding: 18px 0 6px; font-size: 1.4rem; }
+  .subtitle { text-align: center; color: #999; font-size: 0.85rem; margin-bottom: 16px; }
+  .container { display: grid; grid-template-columns: 320px 1fr; gap: 20px; max-width: 1200px; margin: 0 auto; padding: 0 20px 40px; }
+  .panel { background: #1a1a1a; border-radius: 10px; padding: 20px; }
+  label { display: block; font-size: 0.8rem; color: #aaa; margin-bottom: 4px; margin-top: 14px; }
+  label:first-child { margin-top: 0; }
+  input[type="file"], input[type="text"], input[type="range"] { width: 100%; }
+  input[type="text"] { padding: 8px; border: 1px solid #333; border-radius: 6px; background: #222; color: #eee; font-size: 0.9rem; }
+  input[type="range"] { accent-color: #4a9eff; }
+  .steps-val { font-size: 0.8rem; color: #aaa; text-align: right; }
+  .btn { display: inline-flex; align-items: center; justify-content: center; padding: 10px 16px; border: none; border-radius: 6px; font-size: 0.9rem; cursor: pointer; transition: background 0.15s; color: #fff; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { background: #2563eb; }
+  .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+  .btn-dir { background: #333; min-width: 80px; }
+  .btn-dir:hover:not(:disabled) { background: #444; }
+  .btn-danger { background: #dc2626; }
+  .btn-danger:hover:not(:disabled) { background: #b91c1c; }
+  .start-row { margin-top: 18px; }
+  .drive-label { font-size: 0.85rem; color: #aaa; margin: 18px 0 8px; }
+  .dir-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+  .dir-bottom { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
+  .reset-row { margin-top: 18px; }
+  .preview-img { width: 100%; border-radius: 8px; background: #222; min-height: 200px; object-fit: contain; }
+  .video-el { width: 100%; border-radius: 8px; background: #000; margin-top: 12px; }
+  .status { margin-top: 12px; padding: 10px; background: #222; border-radius: 6px; font-size: 0.85rem; color: #aaa; min-height: 40px; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #555; border-top-color: #4a9eff; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (max-width: 720px) { .container { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<h1>LingBot-World Stage 1 Demo</h1>
+<p class="subtitle">Upload a dashcam image, click Start, then drive with direction buttons.</p>
+
+<div class="container">
+  <!-- Left panel: controls -->
+  <div class="panel">
+    <label for="img-upload">Upload First Frame</label>
+    <input type="file" id="img-upload" accept="image/*">
+
+    <label for="prompt-input">Prompt</label>
+    <input type="text" id="prompt-input" value="A dashcam view of a vehicle driving on a road.">
+
+    <label for="steps-slider">Denoising Steps</label>
+    <input type="range" id="steps-slider" min="4" max="70" value="STEPS_PLACEHOLDER" step="1">
+    <div class="steps-val" id="steps-val">STEPS_PLACEHOLDER</div>
+
+    <div class="start-row">
+      <button class="btn btn-primary" id="btn-start" style="width:100%">Start Session</button>
+    </div>
+
+    <div class="drive-label">Drive</div>
+    <div class="dir-grid">
+      <button class="btn btn-dir" id="btn-left" disabled>A Left</button>
+      <button class="btn btn-primary btn-dir" id="btn-fwd" disabled>W Fwd</button>
+      <button class="btn btn-dir" id="btn-right" disabled>D Right</button>
+    </div>
+    <div class="dir-bottom">
+      <button class="btn btn-dir" id="btn-rev" disabled>S Rev</button>
+      <button class="btn btn-dir" id="btn-coast" disabled>Coast</button>
+    </div>
+
+    <div class="reset-row">
+      <button class="btn btn-danger" id="btn-reset" style="width:100%">Reset</button>
+    </div>
+  </div>
+
+  <!-- Right panel: outputs -->
+  <div class="panel">
+    <img id="preview" class="preview-img" alt="Current frame preview">
+    <video id="video" class="video-el" controls autoplay muted></video>
+    <div class="status" id="status">Upload an image and click Start.</div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const stepsSlider = $('#steps-slider');
+const stepsVal = $('#steps-val');
+stepsSlider.addEventListener('input', () => { stepsVal.textContent = stepsSlider.value; });
+
+const dirBtns = ['#btn-fwd','#btn-left','#btn-right','#btn-rev','#btn-coast'].map($);
+function setDriveBtns(enabled) { dirBtns.forEach(b => b.disabled = !enabled); }
+function setAllBtns(enabled) {
+  setDriveBtns(enabled);
+  $('#btn-start').disabled = !enabled;
+  $('#btn-reset').disabled = !enabled;
+}
+
+function setStatus(msg, loading) {
+  $('#status').innerHTML = (loading ? '<span class="spinner"></span>' : '') + msg;
+}
+
+function refreshPreview() {
+  $('#preview').src = '/api/preview?' + Date.now();
+}
+
+// Start session
+$('#btn-start').addEventListener('click', async () => {
+  const fileInput = $('#img-upload');
+  if (!fileInput.files.length) { setStatus('Please select an image first.'); return; }
+  setAllBtns(false);
+  setStatus('Starting session...', true);
+  const form = new FormData();
+  form.append('image', fileInput.files[0]);
+  form.append('prompt', $('#prompt-input').value);
+  form.append('steps', stepsSlider.value);
+  try {
+    const res = await fetch('/api/start', { method: 'POST', body: form });
+    const data = await res.json();
+    if (res.ok) {
+      refreshPreview();
+      setStatus(data.status);
+      setAllBtns(true);
+    } else {
+      setStatus('Error: ' + (data.detail || res.statusText));
+      setAllBtns(true);
+    }
+  } catch (e) {
+    setStatus('Network error: ' + e.message);
+    setAllBtns(true);
+  }
+});
+
+// Drive buttons
+const dirMap = {
+  'btn-fwd': 'forward',
+  'btn-left': 'forward_left',
+  'btn-right': 'forward_right',
+  'btn-rev': 'reverse',
+  'btn-coast': 'coast',
+};
+Object.entries(dirMap).forEach(([id, direction]) => {
+  $('#' + id).addEventListener('click', async () => {
+    setAllBtns(false);
+    setStatus('Generating ' + direction + '...', true);
+    try {
+      const res = await fetch('/api/drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ direction, steps: parseInt(stepsSlider.value) }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        setStatus('Error: ' + (err.detail || res.statusText));
+        setAllBtns(true);
+        return;
+      }
+      // Response is MP4 binary — read status from header
+      const statusMsg = decodeURIComponent(res.headers.get('X-Status') || '');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const video = $('#video');
+      video.src = url;
+      video.play();
+      refreshPreview();
+      setStatus(statusMsg || 'Done');
+      setAllBtns(true);
+    } catch (e) {
+      setStatus('Network error: ' + e.message);
+      setAllBtns(true);
+    }
+  });
+});
+
+// Reset
+$('#btn-reset').addEventListener('click', async () => {
+  setAllBtns(false);
+  setStatus('Resetting...', true);
+  try {
+    const res = await fetch('/api/reset', { method: 'POST' });
+    const data = await res.json();
+    setStatus(data.status || 'Reset.');
+    $('#preview').src = '';
+    $('#video').src = '';
+    setDriveBtns(false);
+    $('#btn-start').disabled = false;
+    $('#btn-reset').disabled = false;
+  } catch (e) {
+    setStatus('Network error: ' + e.message);
+    setAllBtns(true);
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+    @web_app.get("/", response_class=HTMLResponse)
+    async def index():
+        return INDEX_HTML.replace("STEPS_PLACEHOLDER", str(sampling_steps))
+
+    @web_app.post("/api/start")
+    async def api_start(
+        image: UploadFile = File(...),
+        prompt: str = Form("A dashcam view of a vehicle driving on a road."),
+        steps: int = Form(30),
+    ):
+        img_bytes = await image.read()
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB").resize((832, 480))
+
+        state["current_image"] = pil_img
+        state["prompt"] = prompt
+        state["chunk_idx"] = 0
+        state["initialized"] = True
+
+        model.reset()
+        pose_gen.reset()
+
+        if steps != model.sampling_steps:
+            model.sampling_steps = steps
+
+        return JSONResponse({"status": "Ready! Click a direction to generate chunk 1."})
+
+    @web_app.post("/api/drive")
+    async def api_drive(body: dict):
+        if not state["initialized"] or state["current_image"] is None:
+            return JSONResponse(
+                {"detail": "Upload an image and click Start first."},
+                status_code=400,
+            )
+
+        direction = body.get("direction", "forward")
+        steps = int(body.get("steps", 30))
+        keys = direction_key_map.get(direction, {"w"})
+        c2ws, desc = pose_gen.wasd_to_poses(keys)
+        intrinsics = pose_gen.get_default_intrinsics(17)
+
+        if steps != model.sampling_steps:
+            model.sampling_steps = steps
+
+        t0 = time.time()
+        video, _ = model.generate_chunk(
+            img=state["current_image"],
+            prompt=state["prompt"],
+            c2ws=c2ws,
+            intrinsics=intrinsics,
+            frame_num=17,
+            shift=3.0,
+            seed=42,
+        )
+        elapsed = time.time() - t0
+        state["chunk_idx"] += 1
+
+        # Extract last frame as next input — video is (C, N, H, W) in [-1, 1]
+        last_frame = video[:, -1]
+        last_frame = ((last_frame + 1) * 127.5).clamp(0, 255).byte()
+        last_frame = last_frame.permute(1, 2, 0).cpu().numpy()
+        state["current_image"] = Image.fromarray(last_frame)
+
+        # Encode video to MP4 in memory via temp file
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        save_video_mp4(video, tmp.name, fps=10)
+        with open(tmp.name, "rb") as f:
+            mp4_bytes = f.read()
+        os.unlink(tmp.name)
+
+        status_msg = f"Chunk {state['chunk_idx']}: {desc} | {elapsed:.1f}s ({steps} steps)"
+
+        return StreamingResponse(
+            io.BytesIO(mp4_bytes),
+            media_type="video/mp4",
+            headers={"X-Status": status_msg},
+        )
+
+    @web_app.post("/api/reset")
+    async def api_reset():
+        state["current_image"] = None
+        state["prompt"] = ""
+        state["chunk_idx"] = 0
+        state["initialized"] = False
+        model.reset()
+        pose_gen.reset()
+        return JSONResponse({"status": "Session reset. Upload a new image."})
+
+    @web_app.get("/api/preview")
+    async def api_preview():
+        if state["current_image"] is None:
+            return Response(status_code=204)
+        buf = io.BytesIO()
+        state["current_image"].save(buf, format="JPEG", quality=90)
+        return Response(content=buf.getvalue(), media_type="image/jpeg")
+
+    return web_app
+
+
+# ============================================================================
 # CLI entrypoint
 # ============================================================================
 
@@ -907,6 +1394,9 @@ def main(
     waymo_max_segments: int = 0,
     # Dummy data
     dummy_samples: int = 20,
+    # Eval
+    sampling_steps: int = 4,
+    num_eval_samples: int = 5,
     # Model
     hf_repo: str = "robbyant/lingbot-world-base-cam",
 ):
@@ -1072,8 +1562,12 @@ def main(
 
     # --- Evaluate ---
     if eval_model:
-        print(f"Evaluating checkpoint: {checkpoint}")
-        evaluate.remote(checkpoint=checkpoint)
+        print(f"Evaluating checkpoint: {checkpoint} ({sampling_steps} steps)")
+        evaluate.remote(
+            checkpoint=checkpoint,
+            num_samples=num_eval_samples,
+            sampling_steps=sampling_steps,
+        )
         print("Evaluation complete!")
         return
 

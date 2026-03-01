@@ -311,3 +311,164 @@ def patch_model_for_block_causal(model):
         block.forward = types.MethodType(
             block_causal_attn_block_forward, block)
     model.forward = types.MethodType(block_causal_model_forward, model)
+
+
+# =============================================================================
+# Patched generate_chunk: remove per-step empty_cache + optional no-CFG
+# =============================================================================
+
+
+def optimized_generate_chunk(self, img, prompt, c2ws, intrinsics,
+                             frame_num=17, shift=5.0, seed=42, cfg_scale=None):
+    """Optimized generate_chunk for WanI2VCausal.
+
+    Changes from original:
+      1. torch.cuda.empty_cache() moved outside denoising loop (saves ~0.5-1s).
+      2. cfg_scale parameter: when <= 1.0, skips unconditional forward pass
+         entirely (2x speedup for distilled models that don't need CFG).
+         Default None = use self.guide_scale (backward compatible).
+    """
+    import torchvision.transforms.functional as TF_local
+    import torchvision.transforms.functional as TF
+
+    from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+    from tqdm import tqdm
+
+    F_chunk = min(frame_num, ((len(c2ws) - 1) // 4) * 4 + 1)
+    c2ws = c2ws[:F_chunk]
+    intrinsics = intrinsics[:F_chunk]
+
+    lat_f = (F_chunk - 1) // self.vae_stride[0] + 1
+    max_seq_len = lat_f * self._tokens_per_lat_frame
+
+    self._ensure_cache(lat_f)
+
+    # Text encoding (cached)
+    context, context_null = self._encode_text(prompt)
+
+    # Plucker embeddings (chunk-local)
+    dit_cond_dict = self._compute_plucker(c2ws, intrinsics, lat_f)
+
+    # Prepare image conditioning
+    img_t = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+    msk = torch.ones(1, F_chunk, self.lat_h, self.lat_w, device=self.device)
+    msk[:, 1:] = 0
+    msk = torch.concat([
+        torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
+    ], dim=1)
+    msk = msk.view(1, msk.shape[1] // 4, 4, self.lat_h, self.lat_w)
+    msk = msk.transpose(1, 2)[0]
+
+    y = self.vae.encode([
+        torch.concat([
+            torch.nn.functional.interpolate(
+                img_t[None].cpu(), size=(self.h, self.w),
+                mode='bicubic').transpose(0, 1),
+            torch.zeros(3, F_chunk - 1, self.h, self.w)
+        ], dim=1).to(self.device)
+    ])[0]
+    y = torch.concat([msk, y])
+
+    # Noise
+    seed_g = torch.Generator(device=self.device)
+    seed_g.manual_seed(seed)
+    noise = torch.randn(
+        16, lat_f, self.lat_h, self.lat_w,
+        dtype=torch.float32, generator=seed_g, device=self.device)
+
+    skip_cfg = cfg_scale is not None and cfg_scale <= 1.0
+
+    with torch.amp.autocast('cuda', dtype=self.param_dtype), torch.no_grad():
+        # Scheduler
+        scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=self.num_train_timesteps,
+            shift=1, use_dynamic_shifting=False)
+        scheduler.set_timesteps(self.sampling_steps, device=self.device, shift=shift)
+
+        # Denoise with MoE routing + CFG
+        # KV cache only used when single_expert (post-trained causal model)
+        use_kv = self._cache_initialized
+        latent = noise
+        base_args = {
+            'seq_len': max_seq_len,
+            'y': [y],
+            'dit_cond_dict': dit_cond_dict,
+            'frame_offset': self.frame_offset,
+            'use_cache': 'read_only' if use_kv else False,
+        }
+
+        for _, t in enumerate(tqdm(scheduler.timesteps, desc='denoise', leave=False)):
+            latent_model_input = [latent.to(self.device)]
+            timestep = torch.stack([t]).to(self.device)
+
+            # Select expert based on timestep (handles offloading)
+            model = self._get_model_for_timestep(t)
+
+            # Conditional forward pass
+            noise_pred_cond = model(
+                latent_model_input, t=timestep,
+                context=[context[0]], **base_args)[0]
+
+            if skip_cfg:
+                # No CFG: use conditional prediction directly
+                noise_pred = noise_pred_cond
+            else:
+                # Unconditional forward pass (CFG)
+                scale = self.guide_scale[1] if t.item() >= self.boundary else self.guide_scale[0]
+                noise_pred_uncond = model(
+                    latent_model_input, t=timestep,
+                    context=context_null, **base_args)[0]
+                noise_pred = noise_pred_uncond + scale * (
+                    noise_pred_cond - noise_pred_uncond)
+                del noise_pred_uncond
+
+            temp_x0 = scheduler.step(
+                noise_pred.unsqueeze(0), t, latent.unsqueeze(0),
+                return_dict=False, generator=seed_g)[0]
+            latent = temp_x0.squeeze(0)
+
+            del noise_pred_cond, noise_pred
+
+        torch.cuda.empty_cache()
+
+        # Phase 2: Cache-fill (only for single-expert causal mode)
+        if use_kv:
+            cache_model = self.low_noise_model if self.low_noise_model is not None else self.high_noise_model
+            t_zero = torch.zeros(1, device=self.device)
+            _ = cache_model(
+                [latent.to(self.device)], t=t_zero,
+                context=[context[0]],
+                seq_len=max_seq_len, y=[y],
+                dit_cond_dict=dit_cond_dict,
+                frame_offset=self.frame_offset,
+                use_cache='read_write')
+
+        # Advance global frame offset
+        self.frame_offset += lat_f
+
+        # VAE decode
+        videos = self.vae.decode([latent])
+
+    video = videos[0]  # (C, N, H, W)
+
+    # Extract last frame as PIL
+    last = video[:, -1, :, :]
+    last = ((last + 1.0) / 2.0).clamp(0, 1).cpu()
+    last_pil = TF_local.to_pil_image(last)
+
+    del noise, scheduler
+    return video, last_pil
+
+
+def patch_generate_chunk(causal_model):
+    """Monkey-patch WanI2VCausal.generate_chunk with optimized version.
+
+    Optimizations:
+      1. Moves torch.cuda.empty_cache() outside denoising loop (~0.5-1s saved).
+      2. Adds cfg_scale parameter — set to 1.0 to skip CFG (2x speedup).
+
+    Args:
+        causal_model: WanI2VCausal instance.
+    """
+    causal_model.generate_chunk = types.MethodType(
+        optimized_generate_chunk, causal_model)

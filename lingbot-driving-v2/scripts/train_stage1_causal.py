@@ -1,33 +1,25 @@
 """
-train_stage1_causal.py -- Stage 1: Causal Architecture Adaptation.
+train_stage1_causal_patched.py -- Stage 1: Causal Architecture Adaptation (PATCHED).
 
-Converts the bidirectional high-noise expert into a causal model via:
-  1. Block causal attention (chunk-sequential with accumulated past KV)
-  2. Diffusion forcing (per-chunk independent timesteps)
-  3. t=0 cache-fill supervision (clean latent forward for KV conditioning)
+Changes from original:
+  1. cache_fill_step runs EVERY step (not every 4th) with 0.5 weight (not 0.1)
+     → cache-fill share of gradient: 33% (was 2.5%)
+  2. NEW: multi-depth cache-fill — trains on 2-chunk and 3-chunk cache depths,
+     not just 1-chunk, so the model learns to use longer cached histories
+  3. NEW: optional light self-conditioning — on 25% of steps after warmup,
+     replaces ground-truth past chunks with the model's own predictions
+     (detached), exposing it to the distribution it encounters at inference
+  4. NEW: per-chunk diagnostic logging — prints per-chunk loss breakdown so
+     you can see exactly where quality drops off
 
-This is full-parameter training of the 14B high-noise expert.
-
-Usage:
-    # Single node, 8xH100
-    torchrun --nproc_per_node=8 train_stage1_causal.py \
-        --model_dir /path/to/lingbot-world-base-cam \
-        --data_dir /path/to/encoded_data \
-        --output_dir /path/to/stage1_checkpoints \
-        --total_steps 50000
-
-    # Dry run
-    torchrun --nproc_per_node=1 train_stage1_causal.py \
-        --model_dir /path/to/lingbot-world-base-cam \
-        --data_dir /path/to/encoded_data \
-        --output_dir /tmp/stage1_test \
-        --total_steps 10
+Usage: same as original (torchrun --nproc_per_node=8 ...)
 """
 
 import argparse
 import logging
 import math
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -53,12 +45,12 @@ class CausalPostTrainingConfig:
 
     # Model
     model_dir: str = ""
-    expert: str = "high_noise"  # which expert to init from
+    expert: str = "high_noise"
 
     # Data
     data_dir: str = ""
     num_chunks: int = 4
-    chunk_lat_frames: int = 5  # latent frames per chunk
+    chunk_lat_frames: int = 5
     resolution: int = 480
 
     # Training
@@ -78,6 +70,12 @@ class CausalPostTrainingConfig:
     )
     num_train_timesteps: int = 1000
 
+    # --- PATCHED: cache-fill and self-conditioning ---
+    cache_fill_weight: float = 0.5        # was 0.1; share of total gradient
+    cache_fill_max_depth: int = 3         # train on up to 3 past chunks
+    self_cond_prob: float = 0.25          # fraction of steps using self-generated context
+    self_cond_start_step: int = 5000      # don't self-condition until warmed up
+
     # Checkpointing
     output_dir: str = ""
     save_every: int = 2000
@@ -86,7 +84,7 @@ class CausalPostTrainingConfig:
 
     # W&B
     wandb_project: str = "lingbot-posttrain"
-    wandb_run_name: str = ""  # auto-generated if empty
+    wandb_run_name: str = ""
     use_wandb: bool = True
 
 
@@ -98,42 +96,14 @@ class CausalPostTrainingConfig:
 def sample_diffusion_forcing_timesteps(
     batch_size, num_chunks, target_timesteps, device
 ):
-    """Sample per-chunk timesteps from the target set.
-
-    Each chunk gets an independently sampled timestep from the predefined
-    target set. This teaches the model to handle varying noise levels
-    across chunks during autoregressive inference.
-
-    Args:
-        batch_size: Batch size.
-        num_chunks: Number of temporal chunks.
-        target_timesteps: List of allowed timestep values.
-        device: Target device.
-
-    Returns:
-        (B, num_chunks) tensor of timesteps.
-    """
+    """Sample per-chunk timesteps from the target set."""
     t_set = torch.tensor(target_timesteps, device=device, dtype=torch.long)
     indices = torch.randint(0, len(t_set), (batch_size, num_chunks), device=device)
     return t_set[indices]
 
 
 def add_noise_per_chunk(latents, noise, timesteps, chunk_lat_frames, num_train_timesteps):
-    """Add flow-matching noise with per-chunk sigma.
-
-    x_t = (1 - sigma) * x_0 + sigma * noise
-    where sigma = t / num_train_timesteps
-
-    Args:
-        latents: (B, C, T_lat, H_lat, W_lat) clean latents.
-        noise: (B, C, T_lat, H_lat, W_lat) noise.
-        timesteps: (B, num_chunks) per-chunk timesteps.
-        chunk_lat_frames: Latent frames per chunk.
-        num_train_timesteps: Total training timesteps (1000).
-
-    Returns:
-        (B, C, T_lat, H_lat, W_lat) noisy latents.
-    """
+    """Add flow-matching noise with per-chunk sigma."""
     B, C, T_lat, H_lat, W_lat = latents.shape
     num_chunks = timesteps.shape[1]
     noisy = torch.zeros_like(latents)
@@ -141,7 +111,7 @@ def add_noise_per_chunk(latents, noise, timesteps, chunk_lat_frames, num_train_t
     for c in range(num_chunks):
         s = c * chunk_lat_frames
         e = min(s + chunk_lat_frames, T_lat)
-        sigma = timesteps[:, c].float() / num_train_timesteps  # (B,)
+        sigma = timesteps[:, c].float() / num_train_timesteps
         sigma = sigma.view(B, 1, 1, 1, 1)
         noisy[:, :, s:e] = (1.0 - sigma) * latents[:, :, s:e] + sigma * noise[:, :, s:e]
 
@@ -149,22 +119,11 @@ def add_noise_per_chunk(latents, noise, timesteps, chunk_lat_frames, num_train_t
 
 
 # =============================================================================
-# Stage 1 Trainer
+# Stage 1 Trainer (PATCHED)
 # =============================================================================
 
 
 class Stage1Trainer:
-    """
-    Stage 1: Causal architecture adaptation trainer.
-
-    Full-parameter training of the high-noise expert with:
-    - Block causal attention
-    - Diffusion forcing
-    - t=0 cache-fill supervision
-    - FSDP2 (via PyTorch fully_shard)
-    - Gradient checkpointing
-    """
-
     def __init__(self, config: CausalPostTrainingConfig):
         self.config = config
         self.rank = int(os.environ.get("RANK", 0))
@@ -176,6 +135,10 @@ class Stage1Trainer:
 
         if self.world_size > 1:
             dist.init_process_group("nccl")
+
+    # -----------------------------------------------------------------
+    # Model setup (unchanged from original)
+    # -----------------------------------------------------------------
 
     def setup_model(self):
         """Load high-noise expert and configure for training."""
@@ -190,7 +153,6 @@ class Stage1Trainer:
 
         self.wan_cfg = WAN_CONFIGS["i2v-A14B"]
 
-        # Load high-noise expert
         subfolder = (
             self.wan_cfg.high_noise_checkpoint
             if self.config.expert == "high_noise"
@@ -203,17 +165,14 @@ class Stage1Trainer:
             torch_dtype=torch.bfloat16,
         )
 
-        # Log total parameter count before wrapping
         total_params = sum(p.numel() for p in self.model.parameters())
-        model_size_gb = total_params * 2 / 1e9  # bf16
+        model_size_gb = total_params * 2 / 1e9
         logger.info(f"Model loaded: {total_params/1e9:.2f}B params ({model_size_gb:.1f} GB in bf16)")
 
-        # Monkey-patch for block causal training (avoids modifying submodule)
         from model_patches import patch_model_for_block_causal
         patch_model_for_block_causal(self.model)
         logger.info("Applied block causal monkey-patch")
 
-        # Full-parameter training
         self.model.train()
         for p in self.model.parameters():
             p.requires_grad = True
@@ -253,17 +212,13 @@ class Stage1Trainer:
             )
             logger.info(f"FSDP wrapped with {self.world_size} GPUs")
 
-            # Verify sharding: count local params to ensure FSDP is distributing
             local_params = sum(p.numel() for p in self.model.parameters())
             logger.info(
                 f"Local param count after FSDP: {local_params/1e9:.2f}B "
                 f"(expect ~{local_params * self.world_size / 1e9:.1f}B total)"
             )
 
-            # FSDP-aware activation checkpointing — must be applied AFTER FSDP
-            # wrapping. Manual checkpoint wrapping before FSDP causes the
-            # SavedTensorHooks to keep all-gathered params alive across all
-            # blocks (~36 GB leaked), defeating FSDP's memory management.
+            # FSDP-aware activation checkpointing
             if self.config.gradient_checkpointing:
                 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
                     CheckpointImpl,
@@ -281,23 +236,17 @@ class Stage1Trainer:
                     check_fn=lambda module: isinstance(module, WanAttentionBlock),
                 )
 
-                # Verify checkpointing was actually applied
                 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
                     CheckpointWrapper,
                 )
-
                 ckpt_count = sum(
                     1 for m in self.model.modules()
                     if isinstance(m, CheckpointWrapper)
                 )
-                logger.info(
-                    f"FSDP-aware activation checkpointing enabled: "
-                    f"{ckpt_count} CheckpointWrapper modules (expect 40)"
-                )
+                logger.info(f"FSDP-aware activation checkpointing: {ckpt_count} wrapped modules")
         else:
             self.model.to(self.device)
 
-            # Single-GPU gradient checkpointing (no FSDP interaction)
             if self.config.gradient_checkpointing:
                 from torch.utils.checkpoint import checkpoint as ckpt_fn
 
@@ -312,11 +261,10 @@ class Stage1Trainer:
                     block.forward = _make(orig)
                 logger.info("Gradient checkpointing enabled (single GPU)")
 
-        # Compute chunk token size for block causal
+        # Compute chunk token sizes
         vae_stride = self.wan_cfg.vae_stride
         patch_size = self.wan_cfg.patch_size
-        # Compute spatial dimensions at the latent/patch level
-        aspect_ratio = 480 / 832  # default dashcam aspect
+        aspect_ratio = 480 / 832
         max_area = 480 * 832
         lat_h = round(
             math.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1]
@@ -338,12 +286,10 @@ class Stage1Trainer:
             f"lat_h={lat_h}, lat_w={lat_w}"
         )
 
-        # GPU memory diagnostics
         if self.rank == 0:
             self._log_gpu_memory("after model setup")
 
     def _log_gpu_memory(self, label=""):
-        """Log GPU memory usage for diagnostics."""
         if not torch.cuda.is_available():
             return
         alloc = torch.cuda.memory_allocated(self.device) / 1e9
@@ -378,9 +324,6 @@ class Stage1Trainer:
             self.optimizer, lr_lambda
         )
 
-        if self.rank == 0:
-            self._log_gpu_memory("after optimizer init")
-
     def setup_data(self):
         """Set up dataset and dataloader."""
         from data_pipeline import PostTrainingDataset
@@ -407,32 +350,29 @@ class Stage1Trainer:
             drop_last=True,
         )
 
-    def train_step(self, batch):
-        """Single training step with diffusion forcing + block causal attention.
+    # -----------------------------------------------------------------
+    # Core training steps
+    # -----------------------------------------------------------------
 
-        Returns:
-            loss: scalar tensor.
-        """
-        latents = batch["latents"].to(self.device)  # (B, C, T_lat, H, W) bf16
-        context = batch["context"].to(self.device)  # (B, 512, 4096) bf16
-        y = batch["y"].to(self.device)  # (B, 20, T_lat, H, W) bf16
-        plucker_emb = batch["plucker_emb"].to(self.device)  # (B, C_p, T_lat, H, W)
+    def train_step(self, batch):
+        """Single training step with diffusion forcing + block causal attention."""
+        latents = batch["latents"].to(self.device)
+        context = batch["context"].to(self.device)
+        y = batch["y"].to(self.device)
+        plucker_emb = batch["plucker_emb"].to(self.device)
 
         B, C, T_lat, H_lat, W_lat = latents.shape
         num_chunks = T_lat // self.config.chunk_lat_frames
 
-        # Derive token counts from actual data dimensions (avoids FP mismatch)
         patch_h, patch_w = self.wan_cfg.patch_size[1], self.wan_cfg.patch_size[2]
         tokens_per_lat_frame = (H_lat // patch_h) * (W_lat // patch_w)
         tokens_per_chunk = tokens_per_lat_frame * self.config.chunk_lat_frames
         seq_len = num_chunks * tokens_per_chunk
 
-        # Sample per-chunk timesteps from target set
         chunk_ts = sample_diffusion_forcing_timesteps(
             B, num_chunks, self.config.target_timesteps, self.device
         )
 
-        # Add per-chunk noise
         noise = torch.randn_like(latents)
         noisy_latents = add_noise_per_chunk(
             latents, noise, chunk_ts,
@@ -440,21 +380,17 @@ class Stage1Trainer:
             self.config.num_train_timesteps,
         )
 
-        # Expand chunk timesteps to per-token
         frame_ts = chunk_ts.repeat_interleave(self.config.chunk_lat_frames, dim=1)
         token_ts = frame_ts.repeat_interleave(tokens_per_lat_frame, dim=1)
 
-        # Prepare model inputs
         x_list = [noisy_latents[b] for b in range(B)]
         y_list = [y[b] for b in range(B)]
         ctx_list = [context[b] for b in range(B)]
 
-        # Plucker embedding for camera conditioning
         dit_cond_dict = {
             "c2ws_plucker_emb": [plucker_emb[b:b+1] for b in range(B)],
         }
 
-        # Forward with block causal attention
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             preds = self.model(
                 x=x_list,
@@ -467,7 +403,6 @@ class Stage1Trainer:
                 chunk_size_tokens=tokens_per_chunk,
             )
 
-        # Flow matching velocity loss: v_target = noise - x_0
         loss = 0.0
         for b in range(B):
             target = noise[b] - latents[b]
@@ -476,14 +411,22 @@ class Stage1Trainer:
 
         return loss
 
-    def cache_fill_step(self, batch):
-        """t=0 cache-fill supervision step.
+    # -----------------------------------------------------------------
+    # FIX 2: Multi-depth cache-fill step
+    # -----------------------------------------------------------------
 
-        Forward clean latent at t=0, then denoise next chunk using that cache.
-        This bridges the high-noise expert to handle clean encoding.
+    def cache_fill_step(self, batch):
+        """Multi-depth t=0 cache-fill supervision (PATCHED).
+
+        Randomly samples a cache depth of 2 or 3 chunks:
+          - depth=2: clean chunk 1 -> denoise chunk 2  (50%)
+          - depth=3: clean chunks 1-2 -> denoise chunk 3  (50%)
+
+        This teaches the model to use longer cached histories, preventing
+        degradation at chunks 3+ which only saw depth-2 training before.
 
         Returns:
-            loss: scalar tensor (or 0 if not enough chunks).
+            (loss, depth) tuple.
         """
         latents = batch["latents"].to(self.device)
         context = batch["context"].to(self.device)
@@ -492,46 +435,55 @@ class Stage1Trainer:
 
         B, C, T_lat, H_lat, W_lat = latents.shape
         clf = self.config.chunk_lat_frames
+        max_chunks_available = T_lat // clf
 
-        if T_lat < 2 * clf:
-            return torch.tensor(0.0, device=self.device)
+        if max_chunks_available < 2:
+            return torch.tensor(0.0, device=self.device), 0
 
-        # Derive token counts from actual data dimensions
+        # Sample cache depth: how many total chunks (clean + noisy)
+        # depth=2: 1 clean + 1 noisy; depth=3: 2 clean + 1 noisy
+        max_depth = min(self.config.cache_fill_max_depth, max_chunks_available)
+        depth = random.randint(2, max_depth)
+
         patch_h, patch_w = self.wan_cfg.patch_size[1], self.wan_cfg.patch_size[2]
         tokens_per_lat_frame = (H_lat // patch_h) * (W_lat // patch_w)
         seq_per_chunk = tokens_per_lat_frame * clf
 
-        # Split into first chunk (clean) and second chunk (noisy)
-        first_chunk = latents[:, :, :clf]
-        second_chunk = latents[:, :, clf:2*clf]
+        # Split: first (depth-1) chunks are clean, last chunk is noisy
+        num_clean = depth - 1
+        clean_latents = latents[:, :, :num_clean * clf]
+        target_chunk = latents[:, :, num_clean * clf:(num_clean + 1) * clf]
 
-        # Add noise to second chunk at a random timestep
+        # Add noise to the target chunk
         t_val = torch.randint(
             1, self.config.num_train_timesteps, (B, 1), device=self.device
         )
         sigma = t_val.float() / self.config.num_train_timesteps
-        noise_2 = torch.randn_like(second_chunk)
-        noisy_2 = (
-            (1.0 - sigma.view(B, 1, 1, 1, 1)) * second_chunk
-            + sigma.view(B, 1, 1, 1, 1) * noise_2
+        noise_t = torch.randn_like(target_chunk)
+        noisy_target = (
+            (1.0 - sigma.view(B, 1, 1, 1, 1)) * target_chunk
+            + sigma.view(B, 1, 1, 1, 1) * noise_t
         )
 
-        # Concatenate: clean first chunk + noisy second chunk
-        combined = torch.cat([first_chunk, noisy_2], dim=2)  # (B, C, 2*clf, H, W)
+        # Concatenate: clean past chunks + noisy target chunk
+        combined = torch.cat([clean_latents, noisy_target], dim=2)
+        total_lat = combined.shape[2]
+        seq_len = depth * seq_per_chunk
 
-        # Build timesteps: t=0 for first chunk, t_val for second
-        seq_len = 2 * seq_per_chunk
+        # Build timesteps: t=0 for all clean chunks, t_val for target chunk
+        clean_tokens = num_clean * seq_per_chunk
+        target_tokens = seq_per_chunk
 
-        t0_tokens = torch.zeros(B, seq_per_chunk, device=self.device, dtype=torch.long)
-        t1_tokens = t_val.expand(B, seq_per_chunk)
-        token_ts = torch.cat([t0_tokens, t1_tokens], dim=1)
+        t_clean = torch.zeros(B, clean_tokens, device=self.device, dtype=torch.long)
+        t_target = t_val.expand(B, target_tokens)
+        token_ts = torch.cat([t_clean, t_target], dim=1)
 
         x_list = [combined[b] for b in range(B)]
-        y_list = [y[b, :, :2*clf] for b in range(B)]
+        y_list = [y[b, :, :total_lat] for b in range(B)]
         ctx_list = [context[b] for b in range(B)]
 
         dit_cond_dict = {
-            "c2ws_plucker_emb": [plucker_emb[b:b+1, :, :2*clf] for b in range(B)],
+            "c2ws_plucker_emb": [plucker_emb[b:b+1, :, :total_lat] for b in range(B)],
         }
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -546,27 +498,196 @@ class Stage1Trainer:
                 chunk_size_tokens=seq_per_chunk,
             )
 
-        # Loss only on the second chunk (the denoised part)
-        # We want the model to use the clean first chunk's KV to help denoise
+        # Loss only on the target chunk (last chunk in the sequence)
         loss = 0.0
         for b in range(B):
-            # Extract second chunk's prediction
+            pred_target = preds[b][:, num_clean * clf:(num_clean + 1) * clf]
+            velocity_target = noise_t[b] - target_chunk[b]
+            loss = loss + F.mse_loss(pred_target.float(), velocity_target.float())
+        loss = loss / B
+
+        return loss, depth
+
+    # -----------------------------------------------------------------
+    # FIX 3: Self-conditioning step
+    # -----------------------------------------------------------------
+
+    def self_cond_train_step(self, batch):
+        """Training step where past chunks use model's own predictions (PATCHED).
+
+        Instead of ground-truth clean latents for past context, we:
+        1. Run a detached forward pass to get the model's prediction for chunk 1
+        2. Use that prediction as context for denoising chunk 2
+
+        This exposes the model to the distribution it encounters at inference
+        (its own noisy outputs), partially bridging the train-test gap.
+
+        Returns:
+            loss: scalar tensor.
+        """
+        latents = batch["latents"].to(self.device)
+        context = batch["context"].to(self.device)
+        y = batch["y"].to(self.device)
+        plucker_emb = batch["plucker_emb"].to(self.device)
+
+        B, C, T_lat, H_lat, W_lat = latents.shape
+        clf = self.config.chunk_lat_frames
+
+        if T_lat < 2 * clf:
+            return self.train_step(batch)
+
+        patch_h, patch_w = self.wan_cfg.patch_size[1], self.wan_cfg.patch_size[2]
+        tokens_per_lat_frame = (H_lat // patch_h) * (W_lat // patch_w)
+        seq_per_chunk = tokens_per_lat_frame * clf
+
+        # Step 1: Generate model's prediction for chunk 1 (detached)
+        chunk1_gt = latents[:, :, :clf]
+        t1 = torch.randint(
+            1, self.config.num_train_timesteps, (B,), device=self.device
+        )
+        sigma1 = t1.float() / self.config.num_train_timesteps
+        noise1 = torch.randn_like(chunk1_gt)
+        noisy1 = (1 - sigma1.view(B, 1, 1, 1, 1)) * chunk1_gt + sigma1.view(B, 1, 1, 1, 1) * noise1
+
+        token_ts_1 = t1.unsqueeze(1).expand(B, seq_per_chunk)
+        x1_list = [noisy1[b] for b in range(B)]
+        y1_list = [y[b, :, :clf] for b in range(B)]
+        ctx_list = [context[b] for b in range(B)]
+        dit_cond_1 = {
+            "c2ws_plucker_emb": [plucker_emb[b:b+1, :, :clf] for b in range(B)],
+        }
+
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            preds_1 = self.model(
+                x=x1_list, t=token_ts_1, context=ctx_list,
+                seq_len=seq_per_chunk, y=y1_list,
+                dit_cond_dict=dit_cond_1,
+                block_causal=True,
+                chunk_size_tokens=seq_per_chunk,
+            )
+
+        # Recover x_0 prediction from velocity: x_0 = x_t - sigma * v_pred
+        self_chunk1 = torch.stack([
+            noisy1[b] - sigma1[b].view(1, 1, 1, 1) * preds_1[b]
+            for b in range(B)
+        ]).detach()
+
+        # Step 2: Train chunk 2 using self-generated chunk 1 as context
+        chunk2_gt = latents[:, :, clf:2*clf]
+        t2 = torch.randint(
+            1, self.config.num_train_timesteps, (B, 1), device=self.device
+        )
+        sigma2 = t2.float() / self.config.num_train_timesteps
+        noise2 = torch.randn_like(chunk2_gt)
+        noisy2 = (1 - sigma2.view(B, 1, 1, 1, 1)) * chunk2_gt + sigma2.view(B, 1, 1, 1, 1) * noise2
+
+        # Use self_chunk1 (model's prediction) instead of chunk1_gt
+        combined = torch.cat([self_chunk1, noisy2], dim=2)
+        seq_len = 2 * seq_per_chunk
+
+        # t=0 for self-generated chunk 1, t2 for chunk 2
+        t_past = torch.zeros(B, seq_per_chunk, device=self.device, dtype=torch.long)
+        t_curr = t2.expand(B, seq_per_chunk)
+        token_ts = torch.cat([t_past, t_curr], dim=1)
+
+        x_list = [combined[b] for b in range(B)]
+        y_list = [y[b, :, :2*clf] for b in range(B)]
+        dit_cond = {
+            "c2ws_plucker_emb": [plucker_emb[b:b+1, :, :2*clf] for b in range(B)],
+        }
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            preds = self.model(
+                x=x_list, t=token_ts, context=ctx_list,
+                seq_len=seq_len, y=y_list,
+                dit_cond_dict=dit_cond,
+                block_causal=True,
+                chunk_size_tokens=seq_per_chunk,
+            )
+
+        # Loss on chunk 2 only
+        loss = 0.0
+        for b in range(B):
             pred_2 = preds[b][:, clf:2*clf]
-            target_2 = noise_2[b] - second_chunk[b]
+            target_2 = noise2[b] - chunk2_gt[b]
             loss = loss + F.mse_loss(pred_2.float(), target_2.float())
         loss = loss / B
 
         return loss
 
-    def save_checkpoint(self, step):
-        """Save training checkpoint.
+    # -----------------------------------------------------------------
+    # FIX 4: Per-chunk diagnostic logging
+    # -----------------------------------------------------------------
 
-        With FSDP, all ranks must participate in state dict gathering.
-        Only rank 0 writes to disk.
-        """
+    def log_per_chunk_loss(self, batch):
+        """Compute and log per-chunk loss breakdown (diagnostic, no grad)."""
+        latents = batch["latents"].to(self.device)
+        context = batch["context"].to(self.device)
+        y = batch["y"].to(self.device)
+        plucker_emb = batch["plucker_emb"].to(self.device)
+
+        B, C, T_lat, H_lat, W_lat = latents.shape
+        clf = self.config.chunk_lat_frames
+        num_chunks = T_lat // clf
+
+        patch_h, patch_w = self.wan_cfg.patch_size[1], self.wan_cfg.patch_size[2]
+        tokens_per_lat_frame = (H_lat // patch_h) * (W_lat // patch_w)
+        tokens_per_chunk = tokens_per_lat_frame * clf
+        seq_len = num_chunks * tokens_per_chunk
+
+        # Fixed mid-range timestep for comparable measurement across chunks
+        fixed_t = 500
+        chunk_ts = torch.full(
+            (B, num_chunks), fixed_t, device=self.device, dtype=torch.long
+        )
+
+        noise = torch.randn_like(latents)
+        noisy_latents = add_noise_per_chunk(
+            latents, noise, chunk_ts, clf, self.config.num_train_timesteps
+        )
+
+        frame_ts = chunk_ts.repeat_interleave(clf, dim=1)
+        token_ts = frame_ts.repeat_interleave(tokens_per_lat_frame, dim=1)
+
+        x_list = [noisy_latents[b] for b in range(B)]
+        y_list = [y[b] for b in range(B)]
+        ctx_list = [context[b] for b in range(B)]
+        dit_cond_dict = {
+            "c2ws_plucker_emb": [plucker_emb[b:b+1] for b in range(B)],
+        }
+
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            preds = self.model(
+                x=x_list, t=token_ts, context=ctx_list,
+                seq_len=seq_len, y=y_list,
+                dit_cond_dict=dit_cond_dict,
+                block_causal=True,
+                chunk_size_tokens=tokens_per_chunk,
+            )
+
+        target = noise - latents
+        chunk_losses = []
+        for c in range(num_chunks):
+            s = c * clf
+            e = s + clf
+            c_loss = 0.0
+            for b in range(B):
+                c_loss += F.mse_loss(preds[b][:, s:e].float(), target[b, :, s:e].float()).item()
+            c_loss /= B
+            chunk_losses.append(c_loss)
+
+        parts = " | ".join(f"C{c}: {l:.4f}" for c, l in enumerate(chunk_losses))
+        logger.info(f"  Per-chunk loss (t={fixed_t}): {parts}")
+
+        return chunk_losses
+
+    # -----------------------------------------------------------------
+    # Checkpoint save/load (unchanged from original)
+    # -----------------------------------------------------------------
+
+    def save_checkpoint(self, step):
         os.makedirs(self.config.output_dir, exist_ok=True)
 
-        # Gather state dicts (collective operation — all ranks must participate)
         if self.world_size > 1:
             from torch.distributed.fsdp import (
                 FullyShardedDataParallel as FSDP,
@@ -574,13 +695,8 @@ class Stage1Trainer:
                 FullStateDictConfig,
                 StateDictType,
             )
-
-            model_cfg = FullStateDictConfig(
-                offload_to_cpu=True, rank0_only=True
-            )
-            optim_cfg = FullOptimStateDictConfig(
-                offload_to_cpu=True, rank0_only=True
-            )
+            model_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            optim_cfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(
                 self.model, StateDictType.FULL_STATE_DICT, model_cfg, optim_cfg
             ):
@@ -590,7 +706,6 @@ class Stage1Trainer:
             state_dict = self.model.state_dict()
             optim_sd = self.optimizer.state_dict()
 
-        # Only rank 0 writes to disk
         if self.rank != 0:
             return
 
@@ -613,7 +728,6 @@ class Stage1Trainer:
         logger.info(f"Saved checkpoint step {step} -> {path} ({size_gb:.1f} GB)")
 
     def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint and return starting step (handles FSDP)."""
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
         if self.world_size > 1:
@@ -621,16 +735,11 @@ class Stage1Trainer:
                 FullyShardedDataParallel as FSDP,
                 StateDictType,
             )
-
-            with FSDP.state_dict_type(
-                self.model, StateDictType.FULL_STATE_DICT
-            ):
+            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT):
                 self.model.load_state_dict(ckpt["model_state_dict"])
-
             if "optimizer_state_dict" in ckpt:
                 osd = FSDP.optim_state_dict_to_load(
-                    self.model, self.optimizer,
-                    ckpt["optimizer_state_dict"],
+                    self.model, self.optimizer, ckpt["optimizer_state_dict"],
                 )
                 self.optimizer.load_state_dict(osd)
         else:
@@ -644,16 +753,19 @@ class Stage1Trainer:
         logger.info(f"Loaded checkpoint from step {ckpt['step']}")
         return ckpt["step"]
 
+    # -----------------------------------------------------------------
+    # Main training loop (PATCHED)
+    # -----------------------------------------------------------------
+
     def train(self, resume_path=None):
-        """Main training loop."""
         self.setup_model()
         self.setup_optimizer()
         self.setup_data()
 
-        # W&B init (rank 0 only)
+        # W&B init
         if self.config.use_wandb and self.rank == 0:
             import wandb
-            run_name = self.config.wandb_run_name or f"stage1-{self.config.total_steps}steps"
+            run_name = self.config.wandb_run_name or f"stage1-patched-{self.config.total_steps}steps"
             wandb.init(
                 project=self.config.wandb_project,
                 name=run_name,
@@ -670,20 +782,22 @@ class Stage1Trainer:
         data_iter = iter(self.dataloader)
         running_loss = 0.0
         running_cf_loss = 0.0
+        running_sc_loss = 0.0
         step_times = []
         grad_norm = None
 
         self.optimizer.zero_grad()
 
-        # Clear any residual GPU memory from setup and reset peak stats
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
         if self.rank == 0:
             self._log_gpu_memory("before training loop")
 
         logger.info(
-            f"Starting Stage 1 training: steps {start_step}-{self.config.total_steps}, "
-            f"batch={self.config.batch_size}, grad_accum={self.config.gradient_accumulation}, "
+            f"Starting Stage 1 PATCHED training: steps {start_step}-{self.config.total_steps}, "
+            f"cache_fill_weight={self.config.cache_fill_weight}, "
+            f"cache_fill_max_depth={self.config.cache_fill_max_depth}, "
+            f"self_cond_prob={self.config.self_cond_prob} (start@{self.config.self_cond_start_step}), "
             f"effective_batch={self.config.batch_size * self.config.gradient_accumulation * self.world_size}"
         )
 
@@ -696,39 +810,41 @@ class Stage1Trainer:
                 data_iter = iter(self.dataloader)
                 batch = next(data_iter)
 
-            # Log data shapes and pre-forward memory on first step
             if step == start_step and self.rank == 0:
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
                         logger.info(f"  batch[{k}]: {v.shape} {v.dtype}")
                 self._log_gpu_memory("before first forward")
 
-            # Main diffusion forcing loss — backward immediately so the
-            # computation graph is freed before cache_fill_step creates a
-            # second one.  Keeping both graphs alive doubles peak activation
-            # memory (~40 GB each → 80 GB total → OOM on H100).
+            # === Main diffusion forcing loss ===
+            # Backward immediately to free graph before cache_fill creates another
             loss = self.train_step(batch)
             scaled_loss = loss / self.config.gradient_accumulation
             scaled_loss.backward()
 
-            if self.rank == 0 and step == start_step:
-                self._log_gpu_memory("after train_step backward")
+            # === FIX 1+2: Cache-fill EVERY step with higher weight + multi-depth ===
+            cf_loss, cf_depth = self.cache_fill_step(batch)
+            scaled_cf = self.config.cache_fill_weight * cf_loss / self.config.gradient_accumulation
+            scaled_cf.backward()
+            cf_loss_val = cf_loss.item()
 
-            # Cache-fill loss (every 4th step, separate backward to avoid
-            # dual-graph OOM).  Gradients accumulate correctly because we
-            # haven't called zero_grad() yet.
-            cf_loss = torch.tensor(0.0, device=self.device)
-            if step % 4 == 0:
-                cf_loss = self.cache_fill_step(batch)
-                scaled_cf = 0.1 * cf_loss / self.config.gradient_accumulation
-                scaled_cf.backward()
-
-                if self.rank == 0 and step == start_step:
-                    self._log_gpu_memory("after cache_fill backward")
+            # === FIX 3: Self-conditioning (after warmup, 25% of steps) ===
+            sc_loss_val = 0.0
+            use_self_cond = (
+                step >= self.config.self_cond_start_step
+                and random.random() < self.config.self_cond_prob
+            )
+            if use_self_cond:
+                sc_loss = self.self_cond_train_step(batch)
+                scaled_sc = 0.3 * sc_loss / self.config.gradient_accumulation
+                scaled_sc.backward()
+                sc_loss_val = sc_loss.item()
 
             running_loss += loss.item()
-            running_cf_loss += cf_loss.item()
+            running_cf_loss += cf_loss_val
+            running_sc_loss += sc_loss_val
 
+            # Optimizer step on gradient accumulation boundary
             if (step + 1) % self.config.gradient_accumulation == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
@@ -745,31 +861,35 @@ class Stage1Trainer:
             if self.rank == 0 and self.config.total_steps <= 20:
                 logger.info(
                     f"Step {step+1}/{self.config.total_steps} | "
-                    f"Loss: {loss.item():.4f} | CF: {cf_loss.item():.4f} | "
-                    f"Time: {step_time:.2f}s"
+                    f"Loss: {loss.item():.4f} | CF: {cf_loss_val:.4f} (depth={cf_depth}) | "
+                    f"SC: {sc_loss_val:.4f} | Time: {step_time:.2f}s"
                 )
                 self._log_gpu_memory(f"step {step+1}")
 
-            # Periodic logging for full runs
+            # Periodic logging
             if (step + 1) % self.config.log_every == 0 and self.rank == 0:
-                avg_loss = running_loss / self.config.log_every
-                avg_cf = running_cf_loss / self.config.log_every
-                avg_time = sum(step_times[-self.config.log_every:]) / len(
-                    step_times[-self.config.log_every:]
-                )
+                n = self.config.log_every
+                avg_loss = running_loss / n
+                avg_cf = running_cf_loss / n
+                avg_sc = running_sc_loss / n
+                avg_time = sum(step_times[-n:]) / len(step_times[-n:])
                 lr = self.optimizer.param_groups[0]["lr"]
                 eta_h = avg_time * (self.config.total_steps - step - 1) / 3600
 
                 logger.info(
                     f"Step {step+1}/{self.config.total_steps} | "
-                    f"Loss: {avg_loss:.4f} | CF: {avg_cf:.4f} | "
+                    f"Loss: {avg_loss:.4f} | CF: {avg_cf:.4f} | SC: {avg_sc:.4f} | "
                     f"LR: {lr:.2e} | Step: {avg_time:.1f}s | ETA: {eta_h:.1f}h"
                 )
+
+                # FIX 4: Per-chunk loss diagnostic every log_every steps
+                self.log_per_chunk_loss(batch)
 
                 if self._wandb is not None:
                     log_dict = {
                         "loss": avg_loss,
                         "cache_fill_loss": avg_cf,
+                        "self_cond_loss": avg_sc,
                         "lr": lr,
                         "step_time": avg_time,
                         "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
@@ -778,6 +898,7 @@ class Stage1Trainer:
 
                 running_loss = 0.0
                 running_cf_loss = 0.0
+                running_sc_loss = 0.0
 
             # Save
             if (step + 1) % self.config.save_every == 0:
@@ -792,7 +913,7 @@ class Stage1Trainer:
         if self.world_size > 1:
             dist.destroy_process_group()
 
-        logger.info("Stage 1 training complete!")
+        logger.info("Stage 1 PATCHED training complete!")
 
 
 # =============================================================================
@@ -802,7 +923,7 @@ class Stage1Trainer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Stage 1: Causal Architecture Adaptation"
+        description="Stage 1: Causal Architecture Adaptation (PATCHED)"
     )
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--data_dir", required=True)
@@ -821,6 +942,16 @@ def main():
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="lingbot-posttrain")
     parser.add_argument("--no_wandb", action="store_true")
+
+    # Patched hyperparameters
+    parser.add_argument("--cache_fill_weight", type=float, default=0.5,
+                        help="Cache-fill loss weight (default: 0.5, was 0.1)")
+    parser.add_argument("--cache_fill_max_depth", type=int, default=3,
+                        help="Max chunks in cache-fill training (default: 3)")
+    parser.add_argument("--self_cond_prob", type=float, default=0.25,
+                        help="Fraction of steps using self-conditioning (default: 0.25)")
+    parser.add_argument("--self_cond_start_step", type=int, default=5000,
+                        help="Step to begin self-conditioning (default: 5000)")
 
     args = parser.parse_args()
 
@@ -848,6 +979,10 @@ def main():
         gradient_checkpointing=not args.no_gradient_checkpointing,
         wandb_project=args.wandb_project,
         use_wandb=not args.no_wandb,
+        cache_fill_weight=args.cache_fill_weight,
+        cache_fill_max_depth=args.cache_fill_max_depth,
+        self_cond_prob=args.self_cond_prob,
+        self_cond_start_step=args.self_cond_start_step,
     )
 
     trainer = Stage1Trainer(config)

@@ -33,7 +33,8 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
-def load_student_model(model_dir, checkpoint_path, device, sampling_steps=4):
+def load_student_model(model_dir, checkpoint_path, device, sampling_steps=4,
+                       compile=False):
     """Load post-trained student into WanI2VCausal with single expert.
 
     Args:
@@ -41,6 +42,7 @@ def load_student_model(model_dir, checkpoint_path, device, sampling_steps=4):
         checkpoint_path: Path to post-training checkpoint.
         device: CUDA device.
         sampling_steps: Denoising steps (4-6).
+        compile: If True, torch.compile the model for faster inference.
 
     Returns:
         WanI2VCausal instance with loaded weights.
@@ -51,6 +53,8 @@ def load_student_model(model_dir, checkpoint_path, device, sampling_steps=4):
 
     from wan.configs import WAN_CONFIGS
     from wan.image2video import WanI2VCausal
+
+    from model_patches import patch_generate_chunk
 
     cfg = WAN_CONFIGS["i2v-A14B"]
 
@@ -65,6 +69,9 @@ def load_student_model(model_dir, checkpoint_path, device, sampling_steps=4):
         max_area=320 * 576,
         single_expert=True,
     )
+
+    # Apply optimized generate_chunk (no per-step empty_cache, cfg_scale support)
+    patch_generate_chunk(model)
 
     # Load post-trained weights into the high-noise expert
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -84,6 +91,13 @@ def load_student_model(model_dir, checkpoint_path, device, sampling_steps=4):
         logger.info(
             f"Loaded post-trained weights from step {ckpt.get('step', '?')}"
         )
+
+    if compile:
+        logger.info("Compiling model with torch.compile (max-autotune-no-cudagraphs)...")
+        model.high_noise_model = torch.compile(
+            model.high_noise_model, mode="max-autotune-no-cudagraphs"
+        )
+        logger.info("Model compiled. First inference will be slow (compilation warmup).")
 
     return model
 
@@ -190,33 +204,46 @@ def save_video_frames(video_tensor, output_dir, prefix="frame"):
 
 
 def save_video_mp4(video_tensor, output_path, fps=16):
-    """Save video tensor as MP4.
+    """Save video tensor as MP4 (H.264 via ffmpeg for browser compatibility).
 
     Args:
         video_tensor: (C, N, H, W) in [-1, 1].
         output_path: Path to save MP4.
         fps: Frames per second.
     """
-    try:
-        import cv2
-    except ImportError:
-        logger.warning("cv2 not installed, skipping MP4 save")
-        return
+    import subprocess
 
     N = video_tensor.shape[1]
     H, W = video_tensor.shape[2], video_tensor.shape[3]
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+    # Write raw frames to a pipe, let ffmpeg encode H.264
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{W}x{H}",
+        "-pix_fmt", "rgb24",
+        "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
 
     for i in range(N):
         frame = video_tensor[:, i]
         frame = ((frame + 1.0) / 2.0).clamp(0, 1)
         frame = (frame * 255).byte().permute(1, 2, 0).cpu().numpy()
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        writer.write(frame_bgr)
+        proc.stdin.write(frame.tobytes())
 
-    writer.release()
+    proc.stdin.close()
+    proc.wait()
 
 
 def evaluate_checkpoint(
